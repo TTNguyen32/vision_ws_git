@@ -152,6 +152,7 @@ ros2 run cloud_pipeline map_pip_mocap \
     -p sor_mean_k:=2000\
     -p collection_duration_sec:=20.0\
     -p mesh_path:="$MESH_OUTPUT"\
+    -p normal_file_path:="$NORMAL_FILE" \
     -p use_previous_normal:="$USE_PREVIOUS_NORMAL" &
 
 MAP_PIP_PID=$!
