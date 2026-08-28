@@ -100,6 +100,7 @@ public:
         // MEMORIES
         save_path_ = declare_parameter<std::string>("save_path",std::string(std::getenv("HOME")) + "/vision_ws/global_map.pcd");       
         mesh_path_ = declare_parameter<std::string>("mesh_path",""); 
+        normal_file_path_ = declare_parameter<std::string>("normal_file_path",""); 
         
         // ----------------
         // OPERATIONS
@@ -802,7 +803,7 @@ private:
         Eigen::Vector3d& point,
         Eigen::Quaterniond& orientation)
     {
-        const std::string path = "locked_target.yaml";
+        const std::string path = this->get_parameter("normal_file_path").as_string();
 
         std::ifstream file(path);
 
@@ -1481,7 +1482,9 @@ private:
             return;
         }
 
-        std::ofstream file("locked_target.yaml");
+        const std::string path = this->get_parameter("normal_file_path").as_string();
+
+        std::ofstream file(path);
 
         file << std::fixed << std::setprecision(6);
 
@@ -1506,7 +1509,7 @@ private:
     }
 
     // params
-    std::string cloud_topic_, global_map_topic_, processed_topic_, normals_topic_, frame_id_, save_path_, mesh_path_,
+    std::string cloud_topic_, global_map_topic_, processed_topic_, normals_topic_, frame_id_, save_path_, mesh_path_, normal_file_path_,
                 clicked_topic_, clusters_topic_, target_topic_, rim_topic_, cylinder_marker_topic_, mesh_topic_;
     std::string world_frame_, lidar_frame_;
 
