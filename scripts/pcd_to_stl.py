@@ -1,4 +1,4 @@
-#!/home/tin/miniconda3/envs/lidar/bin/python
+#!/usr/bin/env python3
 """Convert a PointCloud2 .pcd file into a triangulated .stl mesh.
 
 Standalone CLI. Typical use:

@@ -1,29 +1,41 @@
 #!/bin/bash
-# run_mid360_dlio_mappip.sh
+# run_mid360_dlio_mappipmocap_poisson.sh
 # Brings up the Livox Mid-360 driver, DLIO (feature/ros2 branch), RViz2 with a
-# custom saved config, and finally the map_pip (cloud_accumulator) node.
+# custom saved config, and finally the map_pip (cloud_pipeline) node.
 # Mirrors the workspace-sourcing / trap-cleanup pattern used in run_mid360_fastlio.sh
 # and run_mid360_dlio.sh.
 #
 # Requires: livox_ros_driver2 built in ~/livox_ws, DLIO built in ~/dlio_ws,
-# cloud_accumulator built in ~/vision_ws, and xfer_format = 0 set in the Livox
+# cloud_pipeline built in ~/vision_ws_git, and xfer_format = 0 set in the Livox
 # launch file (msg_MID360_launch.py) so /livox/lidar publishes
 # sensor_msgs/PointCloud2 with per-point timestamps rather than CustomMsg.
 
 set -e
 
-# --- Path to your saved RViz2 config ---
-RVIZ_CONFIG=~/vision_ws/src/cloud_accumulator/src/map_pip.rviz
+# --- Timestamp for this run ---
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-# --- Path to DLIO's redirected log file ---
-DLIO_LOG=/tmp/dlio.log
-: > "$DLIO_LOG"   # truncate/create fresh log each run
+# --- Output directories ---
+OUTPUT_DIR="$HOME/vision_ws_outputs"
+MAP_DIR="$OUTPUT_DIR/maps"
+MESH_DIR="$OUTPUT_DIR/meshes"
+NORMAL_DIR="$OUTPUT_DIR/normals"
+LOG_DIR="$OUTPUT_DIR/logs"
+
+# Create output directories if they don't exist
+mkdir -p "$MAP_DIR" "$MESH_DIR" "$NORMAL_DIR" "$LOG_DIR"
+
+# --- Path to saved RViz2 config ---
+RVIZ_CONFIG="$HOME/vision_ws_git/config/map_pip.rviz"
+
+# --- Path to DLIO log ---
+DLIO_LOG="$LOG_DIR/dlio_${TIMESTAMP}.log"
 
 # --- Source workspaces in order ---
 source /opt/ros/humble/setup.bash
 source ~/livox_ws/install/setup.bash
 source ~/dlio_ws/install/setup.bash
-source ~/vision_ws/install/setup.bash
+source ~/vision_ws_git/install/setup.bash
 
 # --- Cleanup: kill all child processes on exit/ctrl-c ---
 DLIO_TAIL_PID=""
@@ -53,7 +65,7 @@ if [[ "$TOPIC_TYPE" != *"PointCloud2"* ]]; then
 fi
 
 # ---- Check previous normal and ask if user wants to reuse normal
-NORMAL_FILE="$HOME/vision_ws/locked_target.yaml"
+NORMAL_FILE="$NORMAL_DIR/locked_target.yaml"
 
 USE_PREVIOUS_NORMAL=false
 
@@ -107,7 +119,7 @@ TF_PID=$!
 # before map_pip starts subscribing/collecting.
 sleep 3
 
-# --- Launch RViz2 with the saved cloud_accumulator config ---
+# --- Launch RViz2 with the saved cloud_pipeline config ---
 echo "[3/4] Starting RViz2 with map_pip config..."
 if [[ ! -f "$RVIZ_CONFIG" ]]; then
     echo "WARNING: RViz2 config not found at $RVIZ_CONFIG — launching with defaults."
@@ -116,19 +128,15 @@ else
     ros2 run rviz2 rviz2 -d "$RVIZ_CONFIG" &
 fi
 
-# --- Launch map_pip_mocap (cloud_accumulator) ---
+# --- Launch map_pip_mocap (cloud_pipeline) ---
 
-# /home/tin/lidar-tools/pcd_to_stl.py in.pcd out.stl \
+# python3 scripts/pcd_to_stl.py in.pcd out.stl \
 #  --voxel 0.01 --orient sensor --poisson-depth 8 --keep-largest
 
-MAP_PCD="$HOME/vision_ws/global_map.pcd"
-MESH_BUILD="$HOME/lidar-tools"
-MESH_RECONSTRUCT="$MESH_BUILD/pcd_to_stl.py"
-MESH_OUTPUT="$MESH_BUILD/out.stl"
+MAP_PCD="$MAP_DIR/global_map_${TIMESTAMP}.pcd"
 
-# Remove old map and mesh so we know the next one is from this run
-rm -f "$MAP_PCD"
-rm -f "$MESH_OUTPUT"
+MESH_RECONSTRUCT="$HOME/vision_ws_git/scripts/pcd_to_stl.py"
+MESH_OUTPUT="$MESH_DIR/map_${TIMESTAMP}.stl"
 
 echo "[4/4] Starting map_pip_mocap..."
 echo "      Map will be saved to: $MAP_PCD"
@@ -136,7 +144,7 @@ echo "      Map will be saved to: $MAP_PCD"
 # run BOTH map_pip_mocap and get the process ID to track if process
 # is still running
 
-ros2 run cloud_accumulator map_pip_mocap \
+ros2 run cloud_pipeline map_pip_mocap \
     --ros-args \
     -p save_path:="$MAP_PCD"\
     -p voxel_leaf_size:=0.007\
@@ -183,8 +191,8 @@ echo "=========================================="
 echo ""
 echo "[POST] Checking Mesh reconstruction..."
 
-if [[ ! -x "$MESH_RECONSTRUCT" ]]; then
-    echo "ERROR: Cannot find executable:"
+if [[ ! -f "$MESH_RECONSTRUCT" ]]; then
+    echo "ERROR: Cannot find reconstruction script:"
     echo "       $MESH_RECONSTRUCT"
     exit 1
 fi
@@ -193,9 +201,13 @@ echo "[POST] Running:"
 echo "       $MESH_RECONSTRUCT $MAP_PCD"
 
 (
-    $MESH_RECONSTRUCT "$MAP_PCD" "$MESH_OUTPUT"  --voxel 0.01 --orient sensor --poisson-depth 8 --keep-largest --remove-outliers --crop-to-input
-    #$MESH_RECONSTRUCT "$MAP_PCD" "$MESH_OUTPUT"  --voxel 0.02 --orient sensor --method bpa --keep-largest
-    #$MESH_RECONSTRUCT "$MAP_PCD" "$MESH_OUTPUT"  --method alpha
+    python3 "$MESH_RECONSTRUCT" "$MAP_PCD" "$MESH_OUTPUT" \
+    --voxel 0.01 \
+    --orient sensor \
+    --poisson-depth 8 \
+    --keep-largest \
+    --remove-outliers \
+    --crop-to-input
 )
 
 echo ""
@@ -207,7 +219,7 @@ echo "[POST] af_reconstruct finished."
 
 if [[ ! -f "$MESH_OUTPUT" ]]; then
     echo ""
-    echo "ERROR: Reconstruction finished but out_af.off was not created."
+    echo "ERROR: Reconstruction finished but mesh file was not created."
     echo "Expected:"
     echo "  $MESH_OUTPUT"
     exit 1

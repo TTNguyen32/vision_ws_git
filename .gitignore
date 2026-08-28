@@ -14,3 +14,6 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local experiment outputs
+vision_ws_outputs/
