@@ -1,11 +1,12 @@
 // Map pipeline to work with mocap, for selecting more than 1 normal
-//  Using since 18 August 2026
+//  Using since 10 Sep 2026 14:27 (latest - with undo service running)
 // Author: Thanh Tin Nguyen
 // Email: ttn32@cam.ac.uk
 
 // Launch commands:
-//chmod +x ~/vision_ws/run_mid360_dlio_mappipmocap.sh
-//~/vision_ws/run_mid360_dlio_mappipmocap-poisson.sh
+// Run via the repo's launch script (see scripts/run_vision_pip),
+// which sources the built workspace and runs:
+//   ros2 run cloud_pipeline map_pip_mocap_multinormals
 
 #include <memory>
 #include <string>
@@ -44,13 +45,11 @@
 #include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
-#include <pcl/features/normal_3d_omp.h>
 #include <pcl/search/kdtree.h>
-#include <pcl/surface/mls.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/io/vtk_lib_io.h>          // loadPolygonFileSTL
 #include <pcl_conversions/pcl_conversions.h>
-#include <pcl/segmentation/region_growing.h>
-#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/segmentation/sac_segmentation.h>  // SACSegmentationFromNormals for cylinder fit
 
 #include <Eigen/Geometry>
 
@@ -88,7 +87,7 @@ struct SelectedTarget
 class MapPipeline : public rclcpp::Node
 {
 public:
-    MapPipeline() : Node("cloud_accumulator")
+    MapPipeline() : Node("cloud_pipeline")
     {
         // TOPICS
         //cloud_topic_       = declare_parameter<std::string>("cloud_topic", "/dlio/odom_node/pointcloud/deskewed");
@@ -96,13 +95,10 @@ public:
         clicked_topic_     = declare_parameter<std::string>("clicked_topic", "/clicked_point");
         global_map_topic_  = declare_parameter<std::string>("global_map_topic", "/global_map");
         processed_topic_   = declare_parameter<std::string>("processed_topic", "/processed/map");
-        normals_topic_     = declare_parameter<std::string>("normals_topic", "/processed/normals");
-        clusters_topic_    = declare_parameter<std::string>("clusters_topic", "/processed/clusters");
         //target_topic_      = declare_parameter<std::string>("locked_target", "/processed/locked_target");
         targets_topic_     = declare_parameter<std::string>("targets_topic", "/processed/selected_normals");
         targets_markers_topic_ = declare_parameter<std::string>("targets_markers_topic", "selected_normals_markers");
         path_topic_        = declare_parameter<std::string>("path_topic", "/processed/path");
-
         rim_topic_         = declare_parameter<std::string>("cylinder_rim", "/processed/cylinder_rim");
         cylinder_marker_topic_= declare_parameter<std::string>("cylinder_axis", "/processed/cylinder_axis");
         mesh_topic_        = declare_parameter<std::string>("mesh_topic", "/processed/mesh");
@@ -143,20 +139,9 @@ public:
         voxel_leaf_size_        = declare_parameter<double>("voxel_leaf_size", 0.003);
         duplicate_distance_     = declare_parameter<double>("duplicate_distance", 0.001);
 
-        // Normal estimation parameters
+        // SOR denoising parameters
         sor_mean_k_             = declare_parameter<int>("sor_mean_k", 1000);
         sor_stddev_mult_        = declare_parameter<double>("sor_stddev_mult", 10.0);
-        normal_k_search_        = declare_parameter<int>("normal_k_search", 30);
-        mls_poly_               = declare_parameter<int>("mls_poly", 2);
-        mls_search_radius_      = declare_parameter<double>("mls_search_radius", 0.03);
-
-        marker_scale_           = declare_parameter<double>("marker_scale", 0.05);
-        marker_stride_          = declare_parameter<int>("marker_stride", 5);
-
-        // Clustering parameters
-        region_growing_neighbors_ = declare_parameter<int>("region_growing_neighbors", 30);
-        smoothness_threshold_     = declare_parameter<double>("smoothness_threshold", 7.0 / 180.0 * M_PI);
-        curvature_threshold_      = declare_parameter<double>("curvature_threshold", 1.0);
 
         // Cylinder RANSAC parameters
         max_ransac_iterations_        = declare_parameter<int>("max_ransac_iterations", 1000);
@@ -208,28 +193,20 @@ public:
         processed_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
             processed_topic_, rclcpp::QoS(1).transient_local());
 
-        normals_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-            normals_topic_, rclcpp::QoS(1).transient_local());
-
-        cluster_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-            clusters_topic_, rclcpp::QoS(1).transient_local());
-
-        //target_pub_ = create_publisher<geometry_msgs::msg::PoseArray>(    target_topic_ , rclcpp::QoS(1).transient_local());
-
         targets_pub_ = create_publisher<geometry_msgs::msg::PoseArray>(
             targets_topic_ , rclcpp::QoS(1).transient_local());
 
         targets_markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
         targets_markers_topic_, rclcpp::QoS(1).transient_local());
 
+        mesh_pub_ = create_publisher<visualization_msgs::msg::Marker>(
+            mesh_topic_, rclcpp::QoS(1).transient_local());
+
         rim_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
             rim_topic_, rclcpp::QoS(1).transient_local());
 
         cylinder_marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
             cylinder_marker_topic_, rclcpp::QoS(1).transient_local());
-
-        mesh_pub_ = create_publisher<visualization_msgs::msg::Marker>(
-            mesh_topic_, rclcpp::QoS(1).transient_local());
 
         path_pub_ = create_publisher<nav_msgs::msg::Path>(
             path_topic_, rclcpp::QoS(1).transient_local());
@@ -271,9 +248,18 @@ public:
                     std::placeholders::_1,
                     std::placeholders::_2));
 
+        undo_selection_srv_ =
+            this->create_service<std_srvs::srv::Trigger>(
+                "undo_normal_selection",
+                std::bind(
+                    &MapPipeline::undoNormalSelection,
+                    this,
+                    std::placeholders::_1,
+                    std::placeholders::_2));
+
 
         RCLCPP_INFO(get_logger(),
-            "cloud_accumulator: collecting from '%s' for %.1f seconds...",
+            "cloud_pipeline: collecting from '%s' for %.1f seconds...",
             cloud_topic_.c_str(), collection_duration_sec_);
 
     }
@@ -476,388 +462,62 @@ private:
 
         saveMap();
 
+        // Publish the processed global map for RViz
+        {
+            sensor_msgs::msg::PointCloud2 out;
+            pcl::toROSMsg(*global_map_, out);
+            out.header.frame_id = frame_id_;
+            out.header.stamp = now();
+            last_processed_msg_ = out;
+            processed_pub_->publish(out);
+        }
+
+        // Load previously saved selected normals if requested
         if (use_previous_normal_)
         {
-            RCLCPP_INFO(
-                get_logger(),
-                "User selected previous normals.");
+            RCLCPP_INFO(get_logger(), "Loading previous selected normals.");
 
             if (!loadLockedTargets())
             {
-                RCLCPP_ERROR(
-                    get_logger(),
+                RCLCPP_ERROR(get_logger(),
                     "Failed to load previous locked normals.");
             }
             else
             {
                 publishLockedTargets();
             }
+        }
 
-            // Important:
-            // Do NOT run new normal estimation in this mode.
+        // Load mesh — face normals are the source for click-to-select and cylinder fit
+        if (!loadAndPublishMesh(mesh_path_))
+        {
+            RCLCPP_ERROR(get_logger(),
+                "Mesh load failed — click-to-select will not work this session.");
         }
         else
         {
-            RCLCPP_INFO(
-                get_logger(),
-                "User selected new normal estimation.");
+            // Fit cylinder using mesh face centroids + face normals
+            std_msgs::msg::Header hdr;
+            hdr.frame_id = frame_id_;
+            hdr.stamp = now();
 
-            runNormalEstimationMLS();
+            t.start();
+            fitAndPublishCylinder(mesh_centroids_, mesh_face_normals_, hdr);
+            RCLCPP_INFO(get_logger(), "[TIMER] Cylinder Fitting: %.2f ms", t.stop_ms());
         }
 
-        publishMesh(mesh_path_);
+        pipeline_done_ = true;
 
-        // keep republishing processed results 1Hz after pipeline finished.
-        // [this]() defining a small lambda function. if pipeline is not finished, do nothing
-        // if finished, publish results.
-
+        // Keepalive: republish processed cloud at 1 Hz for late-joining RViz subscribers
         keepalive_timer_ = create_wall_timer(
         std::chrono::seconds(1),
         [this]() {
             if (!pipeline_done_) return;
             processed_pub_->publish(last_processed_msg_);
-            normals_pub_->publish(last_normals_msg_);
-
-            // CAUTION: will need to keep publishing clusters,
-            // targets, cylinder fit as well
         });
 
-        // Generate path is done by service call, not automatically after normal estimation.
-
         RCLCPP_INFO(get_logger(),
-            "Pipeline complete. '%s' and '%s' are latched — inspect in RViz2, or Ctrl+C to exit.",
-            processed_topic_.c_str(), normals_topic_.c_str());
-    }
-
-    // ---- MAIN PROCESSING PIPELINE expensive stages, run once on the final collected map ----
-    void runNormalEstimation()
-    {
-
-        // NORMAL ESTIMATION BLOCK:
-        // using planeSVD kNN search tree (could consider switching to MLS)
-
-        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
-        pcl::NormalEstimationOMP<pcl::PointXYZ, pcl::Normal> ne;
-        //ne.setInputCloud(global_map);
-        ne.setInputCloud(global_map_);
-        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-        ne.setNumberOfThreads(4);
-        ne.setSearchMethod(tree);
-        ne.setKSearch(normal_k_search_);
-        ne.compute(*normals);
-
-
-        RCLCPP_INFO(get_logger(), "Normals computed: %zu points -> %zu normals",
-                    global_map_->size(), normals->size());
-
-        auto stamp = get_clock()->now();
-
-        // NormalEstimation is one-to-one with the input cloud by index, but points
-        // with too few valid neighbors come back with a NaN normal — strip those
-        // out, keeping position and normal in lockstep.
-        pcl::PointCloud<PointT>::Ptr seg_input(new pcl::PointCloud<PointT>);
-        pcl::PointCloud<pcl::Normal>::Ptr seg_normals(new pcl::PointCloud<pcl::Normal>);
-        seg_input->points.reserve(global_map_->size());
-        seg_normals->points.reserve(global_map_->size());
-        for (size_t i = 0; i < normals->points.size(); ++i) {
-        const auto& n = normals->points[i];
-        if (std::isfinite(n.normal_x) && std::isfinite(n.normal_y) && std::isfinite(n.normal_z)) {
-            seg_input->points.push_back(global_map_->points[i]);
-            seg_normals->points.push_back(n);
-        }
-        }
-        seg_input->width = seg_input->points.size();
-        seg_input->height = 1;
-        seg_normals->width = seg_normals->points.size();
-        seg_normals->height = 1;
-
-        if (seg_input->empty()) return;
-
-        RCLCPP_INFO(get_logger(), "Normal estimation: %zu valid points (from %zu input points)",
-                seg_input->size(), global_map_->size());
-
-        // REGION GROWING SEGMENTATION
-        pcl::search::KdTree<PointT>::Ptr seg_tree(new pcl::search::KdTree<PointT>());
-
-        pcl::RegionGrowing<PointT, pcl::Normal> reg;
-        reg.setMinClusterSize(20);
-        reg.setMaxClusterSize(100000);
-        reg.setSearchMethod(seg_tree);
-        reg.setNumberOfNeighbours(region_growing_neighbors_); // TUNE: number of neighbors to analyze for each point
-        reg.setInputCloud(seg_input);
-        reg.setInputNormals(seg_normals);
-        reg.setSmoothnessThreshold(smoothness_threshold_);  // TUNE ~3 degree — how "equal" normals must be
-        reg.setCurvatureThreshold(curvature_threshold_);
-
-        std::vector<pcl::PointIndices> clusters;
-        reg.extract(clusters);
-
-        RCLCPP_INFO(get_logger(), "Found %zu normal-consistent clusters", clusters.size());
-
-        sensor_msgs::msg::PointCloud2 out;
-        pcl::toROSMsg(*global_map_, out);
-        out.header.frame_id = frame_id_;
-        out.header.stamp = stamp;
-        last_processed_msg_ = out;      // cache for keepalive republish
-        processed_pub_->publish(out);
-
-        std_msgs::msg::Header hdr;
-        hdr.frame_id = frame_id_;
-        hdr.stamp = stamp;
-
-        // --- Publish normals as MarkerArray ---
-        //publishNormalMarkers(mls_points, msg->header);
-        publishNormalMarkers(seg_input, seg_normals, hdr.stamp);
-
-        // --- Publish clusters as colored point cloud ---
-        publishClusters(seg_input, clusters, hdr);
-
-        // --- Publish cylinder fit ---
-        t.start();
-        fitAndPublishCylinder(seg_input, seg_normals, hdr);
-        RCLCPP_INFO(get_logger(), "[TIMER] Cylinder Fitting: %.2f ms", t.stop_ms());
-
-        // --- Store latest frame's data for the click handler ---
-        last_cloud_ = seg_input;
-        last_normals_ = seg_normals;
-        //last_normals_ = last_normals_;  // Use the normals from MLS, not the Region Growing normals
-        last_clusters_ = clusters;
-        last_header_.stamp = stamp;
-        last_header_.frame_id = frame_id_;
-
-        RCLCPP_INFO(get_logger(), "------------------------");
-        // TODO: need
-        pipeline_done_ = true;
-    }
-
-    void runNormalEstimationMLS()
-    {
-        // ============================================================
-        // MLS: Moving Least Squares smoothing + normal estimation
-        // ============================================================
-
-        pcl::search::KdTree<PointT>::Ptr tree(
-            new pcl::search::KdTree<PointT>());
-
-        pcl::PointCloud<pcl::PointNormal>::Ptr mls_output(
-            new pcl::PointCloud<pcl::PointNormal>);
-
-        pcl::MovingLeastSquares<PointT, pcl::PointNormal> mls;
-
-        mls.setInputCloud(global_map_);
-        mls.setPolynomialOrder(mls_poly_);
-        mls.setSearchMethod(tree);
-
-        // Compute normals
-        mls.setComputeNormals(true);
-
-        // Radius controls how much neighbouring data is used
-        // for the local surface fit.
-        mls.setSearchRadius(mls_search_radius_);
-
-        mls.process(*mls_output);
-
-        // Flip all normals
-        for (auto& n : mls_output->points) {
-            n.normal_x *= -1.0f;
-            n.normal_y *= -1.0f;
-            n.normal_z *= -1.0f;
-        }
-
-        if (mls_output->empty()) {
-            RCLCPP_ERROR(
-                get_logger(),
-                "MLS produced no output points.");
-            return;
-        }
-
-        RCLCPP_INFO(
-            get_logger(),
-            "MLS computed: %zu input points -> %zu output points",
-            global_map_->size(),
-            mls_output->size());
-
-
-        // ============================================================
-        // Remove points with invalid normals
-        // ============================================================
-
-        pcl::PointCloud<PointT>::Ptr seg_input(
-            new pcl::PointCloud<PointT>);
-
-        pcl::PointCloud<pcl::Normal>::Ptr seg_normals(
-            new pcl::PointCloud<pcl::Normal>);
-
-        seg_input->points.reserve(mls_output->size());
-        seg_normals->points.reserve(mls_output->size());
-
-        for (const auto& p : mls_output->points)
-        {
-            if (std::isfinite(p.x) &&
-                std::isfinite(p.y) &&
-                std::isfinite(p.z) &&
-                std::isfinite(p.normal_x) &&
-                std::isfinite(p.normal_y) &&
-                std::isfinite(p.normal_z))
-            {
-                PointT point;
-
-                point.x = p.x;
-                point.y = p.y;
-                point.z = p.z;
-
-                seg_input->points.push_back(point);
-
-                pcl::Normal normal;
-
-                normal.normal_x = p.normal_x;
-                normal.normal_y = p.normal_y;
-                normal.normal_z = p.normal_z;
-                normal.curvature = p.curvature;
-
-                seg_normals->points.push_back(normal);
-            }
-        }
-
-        seg_input->width = seg_input->points.size();
-        seg_input->height = 1;
-        seg_input->is_dense = true;
-
-        seg_normals->width = seg_normals->points.size();
-        seg_normals->height = 1;
-        seg_normals->is_dense = true;
-
-        if (seg_input->empty())
-        {
-            RCLCPP_ERROR(
-                get_logger(),
-                "No valid MLS points/normals remained.");
-            return;
-        }
-
-        RCLCPP_INFO(
-            get_logger(),
-            "MLS: %zu valid points from %zu output points",
-            seg_input->size(),
-            mls_output->size());
-
-
-        // ============================================================
-        // Region Growing Segmentation
-        // ============================================================
-
-        pcl::search::KdTree<PointT>::Ptr seg_tree(
-            new pcl::search::KdTree<PointT>());
-
-        pcl::RegionGrowing<PointT, pcl::Normal> reg;
-
-        reg.setMinClusterSize(20);
-        reg.setMaxClusterSize(100000);
-
-        reg.setSearchMethod(seg_tree);
-        reg.setNumberOfNeighbours(region_growing_neighbors_);
-
-        reg.setInputCloud(seg_input);
-        reg.setInputNormals(seg_normals);
-
-        reg.setSmoothnessThreshold(
-            smoothness_threshold_);
-
-        reg.setCurvatureThreshold(
-            curvature_threshold_);
-
-        std::vector<pcl::PointIndices> clusters;
-
-        reg.extract(clusters);
-
-        RCLCPP_INFO(
-            get_logger(),
-            "Found %zu normal-consistent clusters",
-            clusters.size());
-
-
-        // ============================================================
-        // Publish processed cloud
-        // ============================================================
-
-        auto stamp = get_clock()->now();
-
-        sensor_msgs::msg::PointCloud2 out;
-
-        pcl::toROSMsg(*seg_input, out);
-
-        out.header.frame_id = frame_id_;
-        out.header.stamp = stamp;
-
-        last_processed_msg_ = out;
-
-        processed_pub_->publish(out);
-
-
-        // ============================================================
-        // Header
-        // ============================================================
-
-        std_msgs::msg::Header hdr;
-
-        hdr.frame_id = frame_id_;
-        hdr.stamp = stamp;
-
-
-        // ============================================================
-        // Publish normals
-        // ============================================================
-
-        publishNormalMarkers(
-            seg_input,
-            seg_normals,
-            hdr.stamp);
-
-
-        // ============================================================
-        // Publish clusters
-        // ============================================================
-
-        publishClusters(
-            seg_input,
-            clusters,
-            hdr);
-
-
-        // ============================================================
-        // Cylinder fitting
-        // ============================================================
-
-        t.start();
-
-        fitAndPublishCylinder(
-            seg_input,
-            seg_normals,
-            hdr);
-
-        RCLCPP_INFO(
-            get_logger(),
-            "[TIMER] Cylinder Fitting: %.2f ms",
-            t.stop_ms());
-
-
-        // ============================================================
-        // Store data for click handler
-        // ============================================================
-
-        last_cloud_ = seg_input;
-        last_normals_ = seg_normals;
-        last_clusters_ = clusters;
-
-        last_header_.stamp = stamp;
-        last_header_.frame_id = frame_id_;
-
-
-        RCLCPP_INFO(
-            get_logger(),
-            "------------------------");
-
-        pipeline_done_ = true;
+            "Pipeline complete. Mesh loaded — click faces in RViz2 to select normals, or Ctrl+C to exit.");
     }
 
     bool loadLockedTargets()
@@ -1055,120 +715,15 @@ private:
         targets_markers_pub_->publish(ma);
     }
 
-    // publish clusters of similar normals as colored point clouds for RViz2
-    void publishClusters(
-        const pcl::PointCloud<PointT>::Ptr& cloud,
-        const std::vector<pcl::PointIndices>& clusters,
-        const std_msgs::msg::Header& header)
+    // ---- Load STL, extract per-face centroid + normal, publish RViz marker ----
+    // Returns true if mesh was loaded and face geometry is ready for click lookup.
+    // The old publishMesh() only built an RViz marker from the file URI.
+    // This version also parses the mesh geometry so onClickedPoint can
+    // resolve clicks to face normals (wired up in Stage 2).
+
+    bool loadAndPublishMesh(const std::string& stl_path)
     {
-        pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>);
-
-        for (const auto& cluster : clusters) {
-            // Compute this cluster's centroid
-            float cx = 0, cy = 0, cz = 0;
-            for (int idx : cluster.indices) {
-            cx += cloud->points[idx].x;
-            cy += cloud->points[idx].y;
-            cz += cloud->points[idx].z;
-            }
-            size_t n = cluster.indices.size();
-            cx /= n; cy /= n; cz /= n;
-
-            uint8_t r, g, b;
-            colorFromPosition(cx, cy, cz, r, g, b);
-
-            for (int idx : cluster.indices) {
-            pcl::PointXYZRGB pt;
-            pt.x = cloud->points[idx].x;
-            pt.y = cloud->points[idx].y;
-            pt.z = cloud->points[idx].z;
-            pt.r = r; pt.g = g; pt.b = b;
-            colored->points.push_back(pt);
-            }
-        }
-        colored->width = colored->points.size();
-        colored->height = 1;
-
-        sensor_msgs::msg::PointCloud2 msg;
-        pcl::toROSMsg(*colored, msg);
-        msg.header = header;
-        cluster_pub_->publish(msg);
-    }
-
-
-    void publishNormalMarkers(
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
-        const pcl::PointCloud<pcl::Normal>::Ptr &normals,
-        const rclcpp::Time &stamp)
-    {
-        visualization_msgs::msg::MarkerArray array;
-
-        // Clear all previously displayed normal markers
-        visualization_msgs::msg::Marker wipe;
-        wipe.action = visualization_msgs::msg::Marker::DELETEALL;
-        array.markers.push_back(wipe);
-
-        int stride = std::max(1, marker_stride_);
-        int id = 0;
-
-        for (size_t i = 0;
-            i < cloud->size();
-            i += static_cast<size_t>(stride))
-        {
-            const auto &p = cloud->points[i];
-            const auto &n = normals->points[i];
-
-            if (!std::isfinite(n.normal_x) ||
-                !std::isfinite(n.normal_y) ||
-                !std::isfinite(n.normal_z))
-            {
-                continue;
-            }
-
-            visualization_msgs::msg::Marker arrow;
-
-            arrow.header.frame_id = frame_id_;
-            arrow.header.stamp = stamp;
-
-            arrow.ns = "map_normals";
-            arrow.id = id++;
-            arrow.type = visualization_msgs::msg::Marker::ARROW;
-            arrow.action = visualization_msgs::msg::Marker::ADD;
-
-            geometry_msgs::msg::Point p0, p1;
-
-            p0.x = p.x;
-            p0.y = p.y;
-            p0.z = p.z;
-
-            p1.x = p.x + n.normal_x * marker_scale_;
-            p1.y = p.y + n.normal_y * marker_scale_;
-            p1.z = p.z + n.normal_z * marker_scale_;
-
-            arrow.points.push_back(p0);
-            arrow.points.push_back(p1);
-
-            arrow.scale.x = 0.002;
-            arrow.scale.y = 0.004;
-            arrow.scale.z = 0.006;
-
-            arrow.color.r = 1.0f;
-            arrow.color.g = 0.6f;
-            arrow.color.b = 0.0f;
-            arrow.color.a = 1.0f;
-
-            arrow.pose.orientation.w = 1.0;
-
-            array.markers.push_back(arrow);
-        }
-
-        last_normals_msg_ = array;
-        normals_pub_->publish(array);
-    }
-
-    void publishMesh(const std::string& stl_path)
-    {
-
+        // ---- wait for the STL to appear (same poll as before) ----
         const int max_wait_seconds = 30;
 
         for (int i = 0; i < max_wait_seconds; ++i)
@@ -1177,6 +732,10 @@ private:
             {
                 break;
             }
+
+            RCLCPP_INFO_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "Waiting for mesh file: %s ...", stl_path.c_str());
 
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -1188,15 +747,96 @@ private:
                 "Mesh file was not created within %d seconds: %s",
                 max_wait_seconds,
                 stl_path.c_str());
-            return;
+            return false;
         }
+
+        // ---- load the polygon mesh ----
+        pcl::PolygonMesh polymesh;
+        if (pcl::io::loadPolygonFileSTL(stl_path, polymesh) < 0)
+        {
+            RCLCPP_ERROR(
+                get_logger(),
+                "Failed to parse STL file: %s", stl_path.c_str());
+            return false;
+        }
+
+        pcl::PointCloud<PointT>::Ptr verts(new pcl::PointCloud<PointT>);
+        pcl::fromPCLPointCloud2(polymesh.cloud, *verts);
+
+        if (verts->empty())
+        {
+            RCLCPP_ERROR(get_logger(), "STL contains no vertices: %s", stl_path.c_str());
+            return false;
+        }
+
+        // ---- compute per-face centroid + face normal ----
+        const auto& polygons = polymesh.polygons;
+
+        mesh_centroids_.reset(new pcl::PointCloud<PointT>);
+        mesh_face_normals_.reset(new pcl::PointCloud<pcl::Normal>);
+        mesh_centroids_->points.reserve(polygons.size());
+        mesh_face_normals_->points.reserve(polygons.size());
+
+        size_t degenerate_count = 0;
+
+        for (const auto& face : polygons)
+        {
+            if (face.vertices.size() < 3) continue;
+
+            const auto& a = verts->points[face.vertices[0]];
+            const auto& b = verts->points[face.vertices[1]];
+            const auto& c = verts->points[face.vertices[2]];
+
+            Eigen::Vector3f va(a.x, a.y, a.z);
+            Eigen::Vector3f vb(b.x, b.y, b.z);
+            Eigen::Vector3f vc(c.x, c.y, c.z);
+
+            // face normal via cross product
+            Eigen::Vector3f n = (vb - va).cross(vc - va);
+            float len = n.norm();
+            if (len < 1e-10f)
+            {
+                ++degenerate_count;
+                continue;   // skip degenerate (zero-area) triangles
+            }
+            n /= len;
+
+            // centroid
+            Eigen::Vector3f cent = (va + vb + vc) / 3.0f;
+
+            PointT cp;
+            cp.x = cent.x(); cp.y = cent.y(); cp.z = cent.z();
+            mesh_centroids_->points.push_back(cp);
+
+            pcl::Normal fn;
+            fn.normal_x = n.x(); fn.normal_y = n.y(); fn.normal_z = n.z();
+            mesh_face_normals_->points.push_back(fn);
+        }
+
+        mesh_centroids_->width  = mesh_centroids_->points.size();
+        mesh_centroids_->height = 1;
+        mesh_centroids_->is_dense = true;
+
+        mesh_face_normals_->width  = mesh_face_normals_->points.size();
+        mesh_face_normals_->height = 1;
+        mesh_face_normals_->is_dense = true;
+
+        if (mesh_centroids_->empty())
+        {
+            RCLCPP_ERROR(get_logger(), "All mesh faces were degenerate — nothing to click on.");
+            return false;
+        }
+
+        // KD-tree on centroids for fast click → face lookup
+        mesh_tree_.reset(new pcl::search::KdTree<PointT>);
+        mesh_tree_->setInputCloud(mesh_centroids_);
 
         RCLCPP_INFO(
             get_logger(),
-            "Mesh found! Publishing: %s",
-            stl_path.c_str());
+            "Loaded mesh: %zu faces (%zu degenerate skipped), centroid KD-tree built.",
+            mesh_centroids_->size(), degenerate_count);
 
-
+        // ---- publish RViz mesh marker (same as old publishMesh) ----
         visualization_msgs::msg::Marker mesh;
 
         mesh.header.frame_id = frame_id_;
@@ -1208,26 +848,21 @@ private:
         mesh.type = visualization_msgs::msg::Marker::MESH_RESOURCE;
         mesh.action = visualization_msgs::msg::Marker::ADD;
 
-        // STL file URI
         mesh.mesh_resource = "file://" + stl_path;
 
-        // Position
         mesh.pose.position.x = 0.0;
         mesh.pose.position.y = 0.0;
         mesh.pose.position.z = 0.0;
 
-        // No rotation
         mesh.pose.orientation.x = 0.0;
         mesh.pose.orientation.y = 0.0;
         mesh.pose.orientation.z = 0.0;
         mesh.pose.orientation.w = 1.0;
 
-        // Scale
         mesh.scale.x = 1.0;
         mesh.scale.y = 1.0;
         mesh.scale.z = 1.0;
 
-        // Make mesh visible
         mesh.color.r = 0.5f;
         mesh.color.g = 0.5f;
         mesh.color.b = 0.5f;
@@ -1239,6 +874,8 @@ private:
             get_logger(),
             "Published reconstructed mesh: %s",
             stl_path.c_str());
+
+        return true;
     }
 
     void loadAndPublishPathService(
@@ -1570,7 +1207,7 @@ private:
         // ---------------------------------------------------------
         // 0. Only allow clicks after the pipeline has finished
         // ---------------------------------------------------------
-        if (!pipeline_done_ || collecting_)
+                if (!pipeline_done_ || collecting_)
         {
             RCLCPP_WARN(
                 get_logger(),
@@ -1578,92 +1215,73 @@ private:
             return;
         }
 
-        // ---------------------------------------------------------
-        // 1. Make sure we have cloud + normals + clusters
-        // ---------------------------------------------------------
-        if (last_clusters_.empty() ||
-            !last_cloud_ ||
-            !last_normals_)
+        if (normal_selection_finished_)
         {
             RCLCPP_WARN(
                 get_logger(),
-                "No cluster data yet, ignoring click");
+                "Normal selection has already been finished.");
             return;
         }
 
         // ---------------------------------------------------------
-        // 2. Find nearest point to RViz click
+        // 1. Make sure mesh face data is available
         // ---------------------------------------------------------
-        double best_dist2 =
-            std::numeric_limits<double>::max();
-
-        int best_idx = -1;
-
-        for (size_t i = 0; i < last_cloud_->size(); ++i)
+        if (!mesh_centroids_ || !mesh_tree_ || !mesh_face_normals_)
         {
-            const auto& p = last_cloud_->points[i];
-
-            double dx = p.x - msg->point.x;
-            double dy = p.y - msg->point.y;
-            double dz = p.z - msg->point.z;
-
-            double d2 =
-                dx * dx +
-                dy * dy +
-                dz * dz;
-
-            if (d2 < best_dist2)
-            {
-                best_dist2 = d2;
-                best_idx = static_cast<int>(i);
-            }
+            RCLCPP_WARN(
+                get_logger(),
+                "Mesh face data not loaded yet, ignoring click");
+            return;
         }
 
-        if (best_idx < 0)
+        // ---------------------------------------------------------
+        // 2. Find nearest mesh face centroid to RViz click (KD-tree)
+        // ---------------------------------------------------------
+        PointT click_pt;
+        click_pt.x = static_cast<float>(msg->point.x);
+        click_pt.y = static_cast<float>(msg->point.y);
+        click_pt.z = static_cast<float>(msg->point.z);
+
+        std::vector<int>   idx(1);
+        std::vector<float> dist2(1);
+        if (mesh_tree_->nearestKSearch(click_pt, 1, idx, dist2) < 1)
+        {
+            RCLCPP_WARN(get_logger(), "KD-tree search returned no result");
             return;
+        }
+
+        int best_idx = idx[0];
+        float best_dist2 = dist2[0];
 
         // ---------------------------------------------------------
-        // 3. Get clicked point + corresponding normal
+        // 3. Get face centroid + face normal
         // ---------------------------------------------------------
         const auto& clicked_point =
-            last_cloud_->points[best_idx];
+            mesh_centroids_->points[best_idx];
 
         const auto& normal =
-            last_normals_->points[best_idx];
+            mesh_face_normals_->points[best_idx];
 
-        // ---------------------------------------------------------
-        // 4. Validate normal
-        // ---------------------------------------------------------
-        if (!std::isfinite(normal.normal_x) ||
-            !std::isfinite(normal.normal_y) ||
-            !std::isfinite(normal.normal_z))
-        {
-            RCLCPP_WARN(
-                get_logger(),
-                "Clicked point has invalid normal, ignoring click");
-            return;
-        }
-
-        Eigen::Vector3f normal_vec =
-            normal.getNormalVector3fMap();
+        Eigen::Vector3f normal_vec(
+            normal.normal_x, normal.normal_y, normal.normal_z);
 
         if (normal_vec.norm() < 1e-6f)
         {
             RCLCPP_WARN(
                 get_logger(),
-                "Clicked point has zero-length normal, ignoring click");
+                "Nearest face has zero-length normal, ignoring click");
             return;
         }
 
         normal_vec.normalize();
 
         // ---------------------------------------------------------
-        // 5. Print selection information
+        // 4. Print selection information
         // ---------------------------------------------------------
         RCLCPP_INFO(
             get_logger(),
-            "Clicked point: (%.3f, %.3f, %.3f), "
-            "normal: (%.3f, %.3f, %.3f), distance: %.4f m",
+            "Clicked face centroid: (%.3f, %.3f, %.3f), "
+            "face normal: (%.3f, %.3f, %.3f), distance to click: %.4f m",
             clicked_point.x,
             clicked_point.y,
             clicked_point.z,
@@ -1724,7 +1342,8 @@ private:
             // New normal -> add it
             geometry_msgs::msg::PoseStamped target;
 
-            target.header = last_header_;
+            target.header.frame_id = frame_id_;
+            target.header.stamp = now();
 
             target.pose.position.x =
                 clicked_point.x;
@@ -1768,39 +1387,107 @@ private:
     void finishNormalSelection(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-{
-    if (!pipeline_done_) {
-        response->success = false;
+    {
+        if (!pipeline_done_) {
+            response->success = false;
+            response->message =
+                "Normal estimation is not finished yet.";
+            return;
+        }
+
+        if (collecting_) {
+            response->success = false;
+            response->message =
+                "Point-cloud collection is still running.";
+            return;
+        }
+
+        if (selected_normals_.empty()) {
+            response->success = false;
+            response->message =
+                "No normals have been selected.";
+            return;
+        }
+
+        if (normal_selection_finished_)
+        {
+            response->success = false;
+            response->message =
+                "Normal selection has already been finished.";
+            return;
+        }
+
+        if (!saveSelectedNormals()) {
+            response->success = false;
+            response->message =
+                "Failed to save selected normals.";
+            return;
+        }
+
+        normal_selection_finished_ = true;
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Normal selection finished. "
+            "Further selection changes are disabled.");
+
+        response->success = true;
         response->message =
-            "Normal estimation is not finished yet.";
-        return;
+            "Selected normals saved successfully.";
     }
 
-    if (collecting_) {
-        response->success = false;
-        response->message =
-            "Point-cloud collection is still running.";
-        return;
-    }
+    void undoNormalSelection(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        if (!pipeline_done_)
+        {
+            response->success = false;
+            response->message =
+                "Normal estimation is not finished yet.";
+            return;
+        }
 
-    if (selected_normals_.empty()) {
-        response->success = false;
-        response->message =
-            "No normals have been selected.";
-        return;
-    }
+        if (collecting_)
+        {
+            response->success = false;
+            response->message =
+                "Point-cloud collection is still running.";
+            return;
+        }
 
-    if (!saveSelectedNormals()) {
-        response->success = false;
-        response->message =
-            "Failed to save selected normals.";
-        return;
-    }
+        if (normal_selection_finished_)
+        {
+            response->success = false;
+            response->message =
+                "Normal selection has already been finished. Undo is disabled.";
+            return;
+        }
 
-    response->success = true;
-    response->message =
-        "Selected normals saved successfully.";
-}
+        if (selected_normals_.empty())
+        {
+            response->success = false;
+            response->message =
+                "Nothing to undo.";
+            return;
+        }
+
+        // Remove the most recently selected normal
+        selected_normals_.pop_back();
+
+        // Redraw the remaining normals
+        publishSelectedNormals();
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Undid most recently selected normal. "
+            "%zu normal(s) remaining.",
+            selected_normals_.size());
+
+        response->success = true;
+        response->message =
+            "Removed the most recently selected normal.";
+    }
 
     void publishSelectedNormals()
     {
@@ -1965,27 +1652,6 @@ private:
     }
 
     // Deterministic color from a 3D position — same position always gives same color
-    void colorFromPosition(float x, float y, float z, uint8_t& r, uint8_t& g, uint8_t& b)
-    {
-        // Quantize position to reduce sensitivity to tiny frame-to-frame jitter
-        auto quantize = [](float v, float step) {
-            return static_cast<int64_t>(std::round(v / step));
-        };
-        int64_t qx = quantize(x, 0.04f);  // 4cm buckets — tune to your noise level
-        int64_t qy = quantize(y, 0.04f);
-        int64_t qz = quantize(z, 0.04f);
-
-        // Simple integer hash combining the three quantized coords
-        uint64_t h = static_cast<uint64_t>(qx) * 73856093u
-                    ^ static_cast<uint64_t>(qy) * 19349663u
-                    ^ static_cast<uint64_t>(qz) * 83492791u;
-
-        // Spread hash bits into RGB, keep values in a visible mid-high range
-        r = static_cast<uint8_t>(50 + (h % 206));
-        g = static_cast<uint8_t>(50 + ((h >> 8) % 206));
-        b = static_cast<uint8_t>(50 + ((h >> 16) % 206));
-    }
-
     // RANSAC + Cylinder fitting
     void fitAndPublishCylinder(
         const pcl::PointCloud<PointT>::Ptr& cloud,
@@ -2179,7 +1845,6 @@ private:
 
         global_map_pub_->publish(empty_cloud);
         processed_pub_->publish(empty_cloud);
-        cluster_pub_->publish(empty_cloud);
         rim_pub_->publish(empty_cloud);
 
         // ---------------------------------------------------------
@@ -2195,7 +1860,6 @@ private:
 
         clear_markers.markers.push_back(clear);
 
-        normals_pub_->publish(clear_markers);
         targets_markers_pub_->publish(clear_markers);
         cylinder_marker_pub_->publish(clear_markers);
 
@@ -2230,16 +1894,14 @@ private:
     }
 
     // params
-    std::string cloud_topic_, global_map_topic_, processed_topic_, normals_topic_, frame_id_, save_path_, mesh_path_, locked_targets_path_, path_topic_, path_yaml_,
-                clicked_topic_, clusters_topic_, target_topic_, rim_topic_, cylinder_marker_topic_, mesh_topic_, targets_topic_, targets_markers_topic_;
+    std::string cloud_topic_, global_map_topic_, processed_topic_, frame_id_, save_path_, mesh_path_, locked_targets_path_, path_topic_, path_yaml_,
+                clicked_topic_, rim_topic_, cylinder_marker_topic_, mesh_topic_, targets_topic_, targets_markers_topic_;
     std::string world_frame_, lidar_frame_;
 
-    double voxel_leaf_size_, duplicate_distance_, sor_stddev_mult_, marker_scale_, collection_duration_sec_;
+    double voxel_leaf_size_, duplicate_distance_, sor_stddev_mult_, collection_duration_sec_;
     double tf_lookup_timeout_sec_;
-    int sor_mean_k_, normal_k_search_, marker_stride_, mls_poly_;
+    int sor_mean_k_;
     double min_x_, max_x_, min_y_, max_y_, min_z_, max_z_;
-    int region_growing_neighbors_;
-    double smoothness_threshold_, curvature_threshold_, mls_search_radius_;
     int max_ransac_iterations_;
     double min_ransac_radius_, max_ransac_radius_, ransac_probability_;
 
@@ -2255,31 +1917,31 @@ private:
     bool pipeline_done_ = false;
     bool use_previous_normal_ = false;
     bool generate_path_ = false;
+    bool normal_selection_finished_ = false;
 
     // ROS: Subscriptions/ publishers
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr click_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pub_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_pub_, processed_pub_, cluster_pub_;
-    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr normals_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_pub_, processed_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr mesh_pub_;
     rclcpp::TimerBase::SharedPtr collection_timer_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr rim_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr cylinder_marker_pub_;
-    //rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr path_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
 
     // For cylinder rim and axis visualisation
     Eigen::Vector3f last_cylinder_axis_point_;
     Eigen::Vector3f last_cylinder_axis_dir_;
 
-    // State from the most recent frame, used by onClickedPoint()
-    pcl::PointCloud<PointT>::Ptr last_cloud_;
-    pcl::PointCloud<pcl::Normal>::Ptr last_normals_;
-    std::vector<pcl::PointIndices> last_clusters_;
+    // State used by onClickedPoint() and pipeline
     std_msgs::msg::Header last_header_;
     sensor_msgs::msg::PointCloud2 last_processed_msg_;
-    visualization_msgs::msg::MarkerArray last_normals_msg_;
+
+    // Mesh face geometry for click-to-face-normal lookup and cylinder fit
+    pcl::PointCloud<PointT>::Ptr      mesh_centroids_;       // one point per face (centroid)
+    pcl::PointCloud<pcl::Normal>::Ptr  mesh_face_normals_;    // one normal per face
+    pcl::search::KdTree<PointT>::Ptr  mesh_tree_;            // KD-tree on centroids
 
 
     // a timer to publish processed result (global map) later (different from collection timer)
@@ -2293,7 +1955,7 @@ private:
     // for multiple normals
     std::vector<geometry_msgs::msg::PoseStamped> selected_normals_;
     double normal_merge_radius_;          // declare_parameter("normal_merge_radius", 0.03)
-    std::string normals_save_path_;       // HOME + "/vision_ws/selected_normals.yaml"
+    std::string normals_save_path_;       // set via ROS param "normals_save_path" by the launch script, into vision_ws_outputs/normals/
     // Locked normal targets
     std::vector<geometry_msgs::msg::PoseStamped> locked_targets_;
 
@@ -2301,6 +1963,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr targets_markers_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr finish_selection_srv_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr load_path_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr undo_selection_srv_;
     // rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_srv_, undo_srv_, save_srv_;
 };
 

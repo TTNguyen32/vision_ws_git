@@ -53,7 +53,7 @@ import sys
 
 import numpy as np
 import yaml
-from scipy.interpolate import CubicSpline, splev, splprep
+from scipy.interpolate import CubicSpline
 from scipy.spatial import cKDTree
 
 
@@ -409,38 +409,6 @@ def order_targets(pts, mode="file", start=0):
     return np.asarray(tour)
 
 
-def fit_spline(points, n_samples, smooth=0.0, degree=3, closed=False):
-    """Fit a parametric B-spline through/near `points` and sample it."""
-    p = np.asarray(points, dtype=np.float64)
-
-    # splprep rejects consecutive duplicates
-    keep = np.ones(len(p), dtype=bool)
-    keep[1:] = np.linalg.norm(np.diff(p, axis=0), axis=1) > 1e-9
-    p = p[keep]
-
-    k = min(degree, len(p) - 1)
-    if k < 1:
-        raise ValueError("Need at least 2 distinct points to fit a spline")
-
-    tck, _ = splprep([p[:, 0], p[:, 1], p[:, 2]], s=smooth, k=k, per=bool(closed))
-    u = np.linspace(0.0, 1.0, n_samples)
-    return np.asarray(splev(u, tck)).T, tck
-
-
-def resample_arclength(P, spacing, closed=False):
-    """Resample a polyline to approximately uniform arc-length spacing."""
-    Q = np.vstack([P, P[0]]) if closed else P
-    seg = np.linalg.norm(np.diff(Q, axis=0), axis=1)
-    s = np.concatenate([[0.0], np.cumsum(seg)])
-    total = s[-1]
-    if total < 1e-12:
-        return P
-    n = max(3, int(np.ceil(total / max(spacing, 1e-6))) + 1)
-    su = np.linspace(0.0, total, n)
-    R = np.column_stack([np.interp(su, s, Q[:, i]) for i in range(3)])
-    return R[:-1] if closed else R
-
-
 def solve_ray_offset(contacts, normals, md, offset, hi_scale=4.0, iters=40):
     """Slide each standoff point along its own clicked normal ray until it is
     truly `offset` from the surface.
@@ -471,31 +439,143 @@ def solve_ray_offset(contacts, normals, md, offset, hi_scale=4.0, iters=40):
     return contacts + normals * t[:, None]
 
 
-def project_to_offset(P, md, offset, use_smooth_normal=True, side="outward"):
-    """Move every sample to exactly `offset` from the surface, along the
-    outward direction at its closest point.
+def project_to_offset(P, md, offset, use_smooth_normal=True, side="outward",
+                      relax=1.0, max_step=None):
+    """Correct each sample's *distance* to the surface, moving it only along
+    the local surface normal.
 
-    side="outward" (default): always offset along the mesh's own outward
-        normal. The path is then guaranteed to stay on the outside of the
-        surface, which is what a drone approaching a trunk needs. Requires
-        the STL to have consistent outward-facing normals.
-    side="auto": offset along whichever side the sample is currently on.
-        Use this if the mesh's orientation is unreliable -- but note a
-        sample that drifts inside the surface will then be pushed to the
-        *inside* offset and the path can cut through the trunk.
+    The obvious implementation -- snap each sample to closest_point +
+    n*offset -- is wrong here. That teleports a sample sideways onto its
+    nearest surface feature (measured 32-40 mm of lateral drift on bark-like
+    geometry), so samples leapfrog one another and the ordering along the
+    curve breaks. The visible symptom is the path running past a target and
+    then doubling back through a ~180 deg cusp to reach it.
+
+    Displacing by (offset - d) along the normal fixes the distance without
+    moving the sample along the surface, so the ordering is preserved. It is
+    a gradient step on the distance constraint rather than a projection, so
+    it needs the iteration it already sits inside to converge.
     """
     cp, d, fidx = md.query(P)
 
     n = md.smooth_normal(cp) if use_smooth_normal else md.face_normals[fidx]
 
-    if side == "auto":
-        v = P - cp
-        vn = np.linalg.norm(v, axis=1, keepdims=True)
-        cur = np.where(vn > 1e-9, v / np.maximum(vn, 1e-20), n)
-        flip = np.sum(cur * n, axis=1) < 0.0
-        n = np.where(flip[:, None], -n, n)
+    # Which side of the surface is the sample on? md.query returns an
+    # unsigned distance, and using it directly is a divergence bug: a sample
+    # that starts *inside* the trunk with d > offset gets pushed further
+    # inward and escapes to infinity. The signed distance sends it outward.
+    v = P - cp
+    vn = np.linalg.norm(v, axis=1, keepdims=True)
+    cur = np.where(vn > 1e-9, v / np.maximum(vn, 1e-20), n)
+    inside = np.sum(cur * n, axis=1) < 0.0
 
-    return cp + n * offset, d
+    if side == "auto":
+        n = np.where(inside[:, None], -n, n)
+        signed = d
+    else:
+        signed = np.where(inside, -d, d)
+
+    step = relax * (offset - signed)
+    # Cap a single step so a wildly misplaced sample cannot overshoot and
+    # oscillate; the surrounding iteration converges it over several passes.
+    # The cap must not be derived from `offset` alone -- with --offset 0 that
+    # collapses to zero and disables the correction entirely.
+    cap = 2.0 * max(offset, max_step or 0.0, 1e-3)
+    step = np.clip(step, -cap, cap)
+
+    return P + step[:, None] * n, d
+
+
+def surface_normals_at(P, md, side="outward", use_smooth_normal=True):
+    """Outward unit normal of the offset surface at each sample."""
+    cp, d, fidx = md.query(P)
+    n = md.smooth_normal(cp) if use_smooth_normal else md.face_normals[fidx]
+    v = P - cp
+    vn = np.linalg.norm(v, axis=1, keepdims=True)
+    cur = np.where(vn > 1e-9, v / np.maximum(vn, 1e-20), n)
+    inside = np.sum(cur * n, axis=1) < 0.0
+    if side == "auto":
+        n = np.where(inside[:, None], -n, n)
+    return n, np.where(inside, -d, d)
+
+
+def tangential_smooth(P, md, beta, pinned=None, sweeps=1, side="outward"):
+    """Laplacian smoothing with the displacement projected onto the surface's
+    tangent plane.
+
+    This is the difference between an elastic band and a geodesic. A plain
+    3D Laplacian step pulls the curve off the offset surface (mostly inward,
+    since it cuts corners), and the distance correction then has to undo
+    that -- the two fight, and the result is a curve that is smooth but not
+    shortest. Removing the normal component first means the step only ever
+    slides the curve *along* the surface, so it is a genuine constrained
+    gradient step on curve length: discrete curve-shortening flow, whose
+    fixed points are geodesics."""
+    Q = P.copy()
+    n_pts = len(Q)
+    if n_pts < 3 or beta <= 0.0:
+        return Q
+
+    fixed = np.zeros(n_pts, dtype=bool)
+    if pinned is not None:
+        fixed[pinned] = True
+    fixed[0] = fixed[-1] = True
+
+    for _ in range(sweeps):
+        nrm, _ = surface_normals_at(Q, md, side=side)
+        prev = np.roll(Q, 1, axis=0)
+        nxt = np.roll(Q, -1, axis=0)
+        delta = 0.5 * (prev + nxt) - Q
+        delta[0] = delta[-1] = 0.0
+        # keep only the component lying in the tangent plane
+        delta = delta - np.sum(delta * nrm, axis=1)[:, None] * nrm
+        Q = np.where(fixed[:, None], Q, Q + beta * delta)
+    return Q
+
+
+def geodesic_relax(P, knot_idx, md, offset, spacing, side="outward",
+                   beta=0.5, max_iter=400, tol=1e-7, pin_targets=True,
+                   log=None):
+    """Relax the path to a piecewise geodesic on the offset surface.
+
+    Alternates a tangential smoothing step (shortens the curve while sliding
+    along the surface) with a normal correction (restores the exact offset),
+    resampling within each knot interval so samples stay evenly spaced and
+    the targets never move. Runs to convergence rather than on a fixed
+    schedule -- a geodesic is a fixed point, so stopping early just leaves a
+    longer curve."""
+    prev_length = None
+    for it in range(max_iter):
+
+        fixed = np.zeros(len(P), dtype=bool)
+        if pin_targets:
+            fixed[knot_idx] = True
+
+        P = tangential_smooth(P, md, beta, pinned=np.flatnonzero(fixed),
+                              sweeps=2, side=side)
+
+        Pp, _ = project_to_offset(P, md, offset, side=side, max_step=spacing)
+        P = np.where(fixed[:, None], P, Pp)
+
+        P, knot_idx = resample_preserving(P, knot_idx, spacing)
+
+        # Converge on curve length, not on per-sample movement. Resampling
+        # re-interpolates every iteration and leaves a ~1e-5 m jitter floor
+        # that a displacement tolerance can never get under, so the loop
+        # would always run to max_iter even after the length had plateaued.
+        length = float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1)))
+        if prev_length is not None and length > 0:
+            if abs(length - prev_length) / length < tol:
+                if log:
+                    log(f"Geodesic converged after {it + 1} iterations "
+                        f"(length {length:.4f} m)")
+                return P, knot_idx, True
+        prev_length = length
+
+    if log:
+        log(f"Geodesic did not fully converge in {max_iter} iterations "
+            f"(path is still valid, just not provably shortest)")
+    return P, knot_idx, False
 
 
 def laplacian_smooth(P, beta, pinned=None, closed=False, sweeps=1):
@@ -542,6 +622,8 @@ def build_offset_spline(
     pin_targets=True,
     side="outward",
     project_knots=False,
+    mode="geodesic",
+    log=None,
 ):
     """Alternate projection (hold the offset) and smoothing (hold
     continuity) until the path is both, then fit an interpolating spline
@@ -563,111 +645,91 @@ def build_offset_spline(
     if project_knots and not through_contact:
         knots = solve_ray_offset(targets_xyz, normals, md, offset)
 
-    # Seed: an interpolating spline through the knots, densely resampled to
-    # the requested arc-length spacing.
-    approx_len = np.sum(np.linalg.norm(np.diff(knots, axis=0), axis=1))
-    n_seed = max(len(knots) * 8, int(np.ceil(approx_len / max(spacing, 1e-6))) + 1)
-    P, _ = fit_spline(knots, n_seed, smooth=0.0, closed=closed)
-    P = resample_arclength(P, spacing, closed=closed)
+    # Seed: straight segments between consecutive knots, subdivided to the
+    # requested spacing, with each knot at a known sample index.
+    #
+    # A cubic interpolant through the knots is NOT safe here. With knots in
+    # click order the spacing is very uneven, and cubic interpolation
+    # overshoots enormously -- a seed swinging 1.1 m off a 0.15 m radius
+    # trunk was measured, which the correction step then cannot reel back
+    # before the path length runs away. A linear seed cannot overshoot; the
+    # projection and smoothing supply the curvature.
+    seed_knots = np.vstack([knots, knots[0]]) if closed else knots
+    P, knot_idx = resample_preserving(
+        seed_knots, np.arange(len(seed_knots)), spacing)
 
     # Annealed smoothing: strong early (pull the curve into a sane shape
     # while it is still far from the offset surface), weak late (so the
     # projection wins and the final offset error is small).
+    if mode == "geodesic":
+        # Shortest path on the offset surface between consecutive targets.
+        P, knot_idx, _converged = geodesic_relax(
+            P, knot_idx, md, offset, spacing, side=side,
+            max_iter=max(iterations, 400), pin_targets=pin_targets, log=log)
+        return _finish(P, knot_idx, knots, md, spacing, closed, through_contact)
+
     schedule = np.geomspace(max(smooth_start, 1e-6), max(smooth_end, 1e-9), iterations)
 
-    for beta in schedule:
-        # 1. PROJECT: exact offset from the surface
-        P, _ = project_to_offset(P, md, offset, side=side)
-
-        # 2. PIN: make sure the path still actually visits every target
-        pinned = None
+    def knot_mask(n, idx):
+        m = np.zeros(n, dtype=bool)
         if pin_targets:
-            _, near = cKDTree(P).query(knots, k=1)
-            P[near] = knots
-            pinned = np.unique(near)
+            m[idx] = True
+        return m
 
-        # 3. SMOOTH: restore continuity without moving the pinned samples
-        P = laplacian_smooth(P, float(beta), pinned=pinned, closed=closed, sweeps=2)
+    fixed = knot_mask(len(P), knot_idx)
 
-        # 4. Keep the parameterization uniform so spacing stays meaningful
-        P = resample_arclength(P, spacing, closed=closed)
+    for beta in schedule:
+        # 1. PROJECT the interior samples to exact offset. The knots are left
+        #    alone entirely -- projecting them and snapping them back is what
+        #    used to put a kink at every target on every iteration.
+        Pp, _ = project_to_offset(P, md, offset, side=side, max_step=spacing)
+        P = np.where(fixed[:, None], P, Pp)
+
+        # 2. SMOOTH, holding the knots fixed
+        P = laplacian_smooth(P, float(beta), pinned=np.flatnonzero(fixed),
+                             closed=False, sweeps=2)
+
+        # 3. Resample within each knot interval, so spacing stays uniform
+        #    without ever displacing a knot
+        P, knot_idx = resample_preserving(P, knot_idx, spacing)
+        fixed = knot_mask(len(P), knot_idx)
 
     # Final projection, so the reported error is the true post-hoc one.
-    P, _ = project_to_offset(P, md, offset, side=side)
-    if pin_targets:
-        _, near = cKDTree(P).query(knots, k=1)
-        P[near] = knots
-    P = laplacian_smooth(P, float(smooth_end), closed=closed, sweeps=1)
+    Pp, _ = project_to_offset(P, md, offset, side=side, max_step=spacing)
+    P = np.where(fixed[:, None], P, Pp)
+    P = laplacian_smooth(P, float(smooth_end), pinned=np.flatnonzero(fixed),
+                         closed=False, sweeps=1)
+    P, knot_idx = resample_preserving(P, knot_idx, spacing)
 
-    # Uniform spacing before fitting: a single very short segment gives the
-    # spline's end condition an enormous derivative and it overshoots wildly
-    # (seen as a lone waypoint metres off the surface).
-    P = resample_arclength(P, spacing, closed=closed)
-
-    # Put the exact targets back. The resample above interpolates them away,
-    # so without this the finished curve misses each target by a few mm.
-    if pin_targets and not through_contact:
-        P = insert_points_into_polyline(P, knots, spacing)
-
-    # Build the continuous C2 representation.
-    #
-    # NOTE: do *not* use splprep(s=0) here. With a dense sample set it puts a
-    # knot at every point and rings badly between them -- on a 5 cm offset it
-    # inflated the worst-case offset error from ~4 mm to ~41 mm in testing.
-    # A cubic spline parameterized by cumulative arc length is tridiagonal,
-    # cannot ring like that, and passes exactly through every input sample.
-    spline = make_arclength_spline(P, closed=closed)
-
-    # Resample the spline at uniform arc length, but force a sample to land
-    # exactly on each target. Uniform sampling alone leaves the targets up
-    # to half a spacing away from the nearest waypoint -- the curve passes
-    # through them, but no waypoint sits on them, which is not much use to a
-    # controller that has to actually reach each contact pose.
-    P = eval_spline_uniform(spline, spacing, closed=closed,
-                            include=None if through_contact else knots)
-
-    cp, d, _ = md.query(P)
-    n = md.smooth_normal(cp)
-    outward = P - cp
-    on = np.linalg.norm(outward, axis=1, keepdims=True)
-    outward = np.where(on > 1e-9, outward / np.maximum(on, 1e-20), n)
-
-    return P, d, outward, spline
+    return _finish(P, knot_idx, knots, md, spacing, closed, through_contact)
 
 
-def insert_points_into_polyline(P, pts, spacing):
-    """Make the polyline pass exactly through each of `pts`.
+def resample_preserving(P, knot_idx, spacing):
+    """Resample to uniform arc-length spacing *within each knot interval*,
+    leaving the knots themselves untouched.
 
-    Uniform arc-length resampling interpolates the pinned target positions
-    away, so they have to be put back before the spline is fitted. Where an
-    existing sample is already close, that sample is *replaced* (inserting
-    would create a near-zero-length segment, which destabilizes the spline's
-    end conditions); otherwise the point is inserted into its nearest
-    segment."""
-    P = list(map(np.asarray, P))
-    tol = 0.3 * spacing
+    Resampling the whole path at once interpolates the knots away, and
+    re-snapping the nearest sample back onto each knot afterwards puts a
+    kink at every target. Subdividing per interval avoids both."""
+    pieces, new_idx = [], [0]
 
-    for q in np.atleast_2d(pts):
-        A = np.asarray(P)
-        d = np.linalg.norm(A - q, axis=1)
-        i = int(np.argmin(d))
-        if d[i] <= tol:
-            P[i] = q
+    for a, b in zip(knot_idx[:-1], knot_idx[1:]):
+        seg = P[a:b + 1]
+        d = np.linalg.norm(np.diff(seg, axis=0), axis=1)
+        s = np.concatenate([[0.0], np.cumsum(d)])
+        total = s[-1]
+        if total < 1e-12:
+            pieces.append(seg[:-1])
+            new_idx.append(new_idx[-1] + max(len(seg) - 1, 1))
             continue
+        n = max(2, int(np.ceil(total / max(spacing, 1e-6))) + 1)
+        su = np.linspace(0.0, total, n)
+        out = np.column_stack([np.interp(su, s, seg[:, i]) for i in range(3)])
+        pieces.append(out[:-1])
+        new_idx.append(new_idx[-1] + len(out) - 1)
 
-        # Choose the adjacent segment whose endpoints bracket q best.
-        best, best_cost = None, np.inf
-        for j in (i - 1, i):
-            if j < 0 or j + 1 >= len(P):
-                continue
-            a, b = np.asarray(P[j]), np.asarray(P[j + 1])
-            cost = np.linalg.norm(a - q) + np.linalg.norm(q - b) - np.linalg.norm(a - b)
-            if cost < best_cost:
-                best_cost, best = cost, j + 1
-        P.insert(best if best is not None else i, q)
-
-    return np.asarray(P)
-
+    pieces.append(P[knot_idx[-1]][None, :])
+    return np.vstack(pieces), np.asarray(new_idx)
 
 def make_arclength_spline(P, closed=False):
     """C2 cubic spline through P, parameterized by cumulative arc length."""
@@ -717,7 +779,18 @@ def eval_spline_uniform(spline, spacing, closed=False, include=None):
             fine = np.linspace(lo, hi, 64)
             j = int(np.argmin(np.linalg.norm(spline(fine) - include[m], axis=1)))
             extra.append(fine[j])
-        su = np.unique(np.concatenate([su, np.asarray(extra)]))
+        # Merge the knot parameters into the uniform ones, dropping any
+        # uniform sample that lands almost on top of a knot. Without this the
+        # two nearly coincide and produce a sub-millimetre segment whose
+        # direction is numerical noise -- which reads downstream as a
+        # spurious ~180 deg turn in an otherwise smooth path.
+        extra = np.asarray(extra)
+        tol = 0.4 * spacing
+        keep = np.ones(len(su), dtype=bool)
+        for e in extra:
+            keep &= np.abs(su - e) > tol
+        keep[0] = keep[-1] = True          # always retain the true endpoints
+        su = np.unique(np.concatenate([su[keep], extra, su[[0, -1]]]))
 
     P = spline(su)
     return P[:-1] if closed else P
@@ -747,6 +820,13 @@ def write_yaml(path, P, outward, frame, offset, stats):
             "max": float(stats["max_err"]),
             "rms": float(stats["rms_err"]),
         },
+        "continuity": {
+            "turn_deg_mean": float(stats["cont"]["turn_mean"]),
+            "turn_deg_max": float(stats["cont"]["turn_max"]),
+            "reversals": int(stats["cont"]["reversals"]),
+            "peak_curvature_inv_m": float(stats["cont"]["kmax"]),
+            "geodesic_curvature_median": float(stats["cont"]["kg_median"]),
+        },
         "waypoints": poses,
     }
     with open(path, "w") as f:
@@ -765,6 +845,78 @@ def write_csv(path, P, outward):
 # =====================================================================
 # CLI
 # =====================================================================
+
+
+def _finish(P, knot_idx, knots, md, spacing, closed, through_contact):
+    """Shared tail for both modes: fit the continuous C2 representation,
+    resample it, and derive the per-waypoint outward direction.
+
+    Both modes go through this so the output is byte-for-byte the same shape
+    regardless of how the polyline was produced.
+
+    NOTE: do *not* use splprep(s=0) here. With a dense sample set it puts a
+    knot at every point and rings badly between them -- on a 5 cm offset it
+    inflated the worst-case offset error from ~4 mm to ~41 mm in testing. A
+    cubic spline parameterized by cumulative arc length is tridiagonal,
+    cannot ring like that, and passes exactly through every input sample.
+    """
+    spline = make_arclength_spline(P, closed=closed)
+
+    # The targets are already exact nodes of P, so they are exact nodes of
+    # the spline; sampling it at those parameters reproduces them exactly.
+    P = eval_spline_uniform(spline, spacing, closed=closed,
+                            include=None if through_contact else knots)
+
+    cp, d, _ = md.query(P)
+    n = md.smooth_normal(cp)
+    outward = P - cp
+    on = np.linalg.norm(outward, axis=1, keepdims=True)
+    outward = np.where(on > 1e-9, outward / np.maximum(on, 1e-20), n)
+
+    return P, d, outward, spline
+
+
+def path_continuity(P):
+    """Measure how flyable the path is: turn angle between consecutive
+    segments, and peak discrete curvature."""
+    seg = np.diff(P, axis=0)
+    L = np.linalg.norm(seg, axis=1)
+    ok = L > 1e-12
+    T = seg[ok] / L[ok][:, None]
+    if len(T) < 2:
+        return {"turn_mean": 0.0, "turn_max": 0.0, "reversals": 0, "kmax": 0.0}
+    cos = np.clip(np.sum(T[:-1] * T[1:], axis=1), -1.0, 1.0)
+    ang = np.degrees(np.arccos(cos))
+    d1 = np.gradient(P, axis=0)
+    d2 = np.gradient(d1, axis=0)
+    k = np.linalg.norm(np.cross(d1, d2), axis=1) / np.maximum(
+        np.linalg.norm(d1, axis=1) ** 3, 1e-20)
+    return {
+        "turn_mean": float(ang.mean()),
+        "turn_max": float(ang.max()),
+        "reversals": int((ang > 90.0).sum()),
+        "kmax": float(k.max()),
+    }
+
+
+def geodesic_curvature(P, md):
+    """|kappa_g|: the in-surface (tangential) part of the curvature vector.
+
+    This is the quantity that vanishes on a true geodesic -- a curve on a
+    surface can be strongly curved in 3D while still being geodesic, as long
+    as all of that curvature points along the surface normal (think of a
+    great circle on a sphere). So it, not the 3D curvature, is the right
+    check on whether the path is actually taking the straightest route
+    across the surface."""
+    cp, _, _ = md.query(P)
+    N = md.smooth_normal(cp)
+    d1 = np.gradient(P, axis=0)
+    d2 = np.gradient(d1, axis=0)
+    sp = np.linalg.norm(d1, axis=1)
+    kvec = np.cross(d1, np.cross(d2, d1)) / np.maximum(sp ** 4, 1e-20)[:, None]
+    kg = kvec - np.sum(kvec * N, axis=1)[:, None] * N
+    return np.linalg.norm(kg, axis=1)
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -787,6 +939,11 @@ def main(argv=None):
     ap.add_argument("--smooth-end", type=float, default=0.02,
                     help="final Laplacian smoothing weight, 0..1 (default: 0.02)")
 
+    ap.add_argument("--mode", choices=["geodesic", "elastic"], default="geodesic",
+                    help="geodesic: shortest path along the offset surface "
+                         "between consecutive targets (default). elastic: the "
+                         "older smoothed/regularized path, which is not "
+                         "length-minimizing")
     ap.add_argument("--order", choices=["file", "greedy"], default="file",
                     help="target visiting order (default: file = click order)")
     ap.add_argument("--closed", action="store_true",
@@ -855,6 +1012,8 @@ def main(argv=None):
         pin_targets=not args.no_pin,
         side=args.side,
         project_knots=args.project_knots,
+        mode=args.mode,
+        log=log,
     )
 
     err = np.abs(d - args.offset)
@@ -872,6 +1031,25 @@ def main(argv=None):
     log(f"Offset error: mean {stats['mean_err']*1000:.2f} mm, "
         f"max {stats['max_err']*1000:.2f} mm, "
         f"rms {stats['rms_err']*1000:.2f} mm")
+
+    cont = path_continuity(P)
+    # |kappa_g| is the real check on "is this a geodesic": it vanishes on a
+    # true geodesic regardless of how curved the path looks in 3D.
+    kg = geodesic_curvature(P, md)
+    cont["kg_median"] = float(np.median(kg))
+    stats["cont"] = cont
+    log(f"Continuity: turn/waypoint mean {cont['turn_mean']:.2f} deg, "
+        f"max {cont['turn_max']:.2f} deg, peak curvature {cont['kmax']:.0f} 1/m")
+    log(f"Geodesic curvature |kappa_g| median {cont['kg_median']:.3f} 1/m "
+        f"(0 = exactly geodesic)")
+    if cont["reversals"]:
+        log(f"WARNING: {cont['reversals']} point(s) where the path reverses "
+            f"(>90 deg turn). The curve is still C2, but the drone has to stop "
+            f"and turn around there. This is caused by the order the targets "
+            f"are visited, not by the smoothing"
+            + ("; try --order greedy." if args.order == "file"
+               else " -- even the shortest tour has to double back on these "
+                    "targets."))
 
     write_yaml(args.output, P, outward, frame, args.offset, stats)
     log(f"Wrote {args.output}")

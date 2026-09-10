@@ -1,0 +1,670 @@
+#!/bin/bash
+
+# ============================================================
+# A*STAR Drone Vision Pipeline (fixed)
+#
+# Pipeline:
+#   Livox Mid-360 -> DLIO -> static TF -> RViz2 -> map
+#   accumulation -> PCD -> Poisson mesh reconstruction ->
+#   MeshLab -> previous OR new normal selection ->
+#   optional offset spline generation
+#
+# Fixes applied vs. the previous version of this script:
+#   1. Node is supervised by polling for the output PCD file
+#      (like run_mid360_dlio_mappip.sh), NOT by `wait $MAP_PID`.
+#      map_pip_mocap_multinormals keeps running after saving
+#      the map (it must stay alive to serve
+#      /finish_normal_selection later) so waiting on the
+#      process to exit blocks forever and everything after it
+#      never runs.
+#   2. Node parameter name corrected: save_path (not
+#      output_pcd_path), plus the same tuning params
+#      run_mid360_dlio_mappip.sh passes, for parity.
+#   3. Restored the lidar -> livox_frame static TF publisher
+#      and the dedicated RViz2 instance using map_pip.rviz,
+#      instead of DLIO's bundled default RViz
+#      (rviz:=true on the DLIO launch).
+#
+# Normal source for path:
+#   Previous normals: ~/vision_ws_outputs/normals/locked_target.yaml
+#   New normals:      ~/vision_ws_outputs/normals/selected_normals_TIMESTAMP.yaml
+#
+# Mesh source for path: newly generated map_TIMESTAMP.stl
+# ============================================================
+
+set -e
+
+# Prevent Conda libraries from interfering with ROS/CMake/runtime deps
+unset PYTHONPATH
+unset LD_LIBRARY_PATH
+
+## Kill stale processes
+echo "Checking for stale ROS processes..."
+
+STALE_PIDS=$(pgrep -f 'cloud_pipeline.*map_pip_mocap_multinormals' || true)
+
+if [ -n "$STALE_PIDS" ]; then
+    echo "Killing stale cloud_pipeline processes: $STALE_PIDS"
+    kill -9 $STALE_PIDS 2>/dev/null || true
+fi
+
+sleep 1
+
+echo "Stale process cleanup complete."
+
+# ============================================================
+# Configuration
+# ============================================================
+
+# Repo root, resolved relative to this script's location
+# (this script lives at $REPO_DIR/scripts/run_vision_pip), so it
+# works regardless of where the repo is cloned.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+OUTPUT_DIR="$HOME/vision_ws_outputs"
+
+MAP_DIR="$OUTPUT_DIR/maps"
+MESH_DIR="$OUTPUT_DIR/meshes"
+NORMAL_DIR="$OUTPUT_DIR/normals"
+PATH_DIR="$OUTPUT_DIR/paths"
+LOG_DIR="$OUTPUT_DIR/logs"
+
+MESH_RECONSTRUCT="$REPO_DIR/scripts/pcd_to_stl.py"
+SPLINE_SCRIPT="$REPO_DIR/scripts/offset_spline.py"
+
+RVIZ_CONFIG="$REPO_DIR/config/map_pip.rviz"
+
+LOCKED_TARGET_FILE="$NORMAL_DIR/locked_target.yaml"
+
+# Spline parameters
+SPLINE_OFFSET=0.05
+SPLINE_SPACING=0.01
+SPLINE_ITERATIONS=60
+SPLINE_SMOOTH_START=0.6
+SPLINE_SMOOTH_END=0.02
+
+# ============================================================
+# Helper: count targets in a normals YAML file.
+# Runs inside the 'lidar' conda env (same one used for mesh/
+# spline scripts) because system python3 doesn't have pyyaml.
+# ============================================================
+
+count_targets() {
+    local yaml_file="$1"
+    local tmp_script
+    tmp_script=$(mktemp /tmp/count_targets_XXXXXX.py)
+
+    cat > "$tmp_script" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r") as f:
+    data = yaml.safe_load(f)
+
+targets = data.get("targets", [])
+print(len(targets) if isinstance(targets, list) else 0)
+PY
+
+    conda run -n lidar python "$tmp_script" "$yaml_file"
+    rm -f "$tmp_script"
+}
+
+# ============================================================
+# Timestamp / output paths
+# ============================================================
+
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+MAP_OUTPUT="$MAP_DIR/global_map_${TIMESTAMP}.pcd"
+MESH_OUTPUT="$MESH_DIR/map_${TIMESTAMP}.stl"
+NORMAL_OUTPUT="$NORMAL_DIR/selected_normals_${TIMESTAMP}.yaml"
+
+PATH_OUTPUT="$PATH_DIR/path_${TIMESTAMP}.yaml"
+PATH_CSV="$PATH_DIR/path_${TIMESTAMP}.csv"
+
+DLIO_LOG="$LOG_DIR/dlio_${TIMESTAMP}.log"
+
+mkdir -p "$MAP_DIR" "$MESH_DIR" "$NORMAL_DIR" "$PATH_DIR" "$LOG_DIR"
+: > "$DLIO_LOG"
+
+# Remove any stale files at these exact paths
+rm -f \
+    "$MAP_OUTPUT" \
+    "$MESH_OUTPUT" \
+    "$NORMAL_OUTPUT" \
+    "$PATH_OUTPUT" \
+    "$PATH_CSV"
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+cleanup() {
+
+    # Disable all cleanup traps immediately so cleanup
+    # cannot run twice.
+    trap - EXIT INT TERM
+
+    echo ""
+    echo "=========================================="
+    echo "Cleaning up"
+    echo "=========================================="
+
+    for pid_var in MAP_PID DLIO_PID TF_PID RVIZ_PID LIVOX_PID; do
+
+        pid="${!pid_var:-}"
+
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+
+            echo "Stopping $pid_var ($pid)..."
+
+            kill "$pid" 2>/dev/null || true
+
+        fi
+
+    done
+
+    # Don't wait indefinitely for ROS to shut down.
+    sleep 1
+
+    # Force any remaining processes to exit.
+    for pid_var in MAP_PID DLIO_PID TF_PID RVIZ_PID LIVOX_PID; do
+
+        pid="${!pid_var:-}"
+
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+
+            echo "Force stopping $pid_var ($pid)..."
+
+            kill -9 "$pid" 2>/dev/null || true
+
+        fi
+
+    done
+
+    echo "Cleanup complete."
+
+}
+
+trap cleanup EXIT INT TERM
+# ============================================================
+# Source workspaces
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "Initialising ROS 2 environment"
+echo "=========================================="
+
+source /opt/ros/humble/setup.bash
+
+if [[ -f "$HOME/livox_ws/install/setup.bash" ]]; then
+    source "$HOME/livox_ws/install/setup.bash"
+else
+    echo "WARNING: Livox workspace not found: $HOME/livox_ws/install/setup.bash"
+fi
+
+if [[ -f "$HOME/dlio_ws/install/setup.bash" ]]; then
+    source "$HOME/dlio_ws/install/setup.bash"
+else
+    echo "WARNING: DLIO workspace not found: $HOME/dlio_ws/install/setup.bash"
+fi
+
+if [[ -f "$REPO_DIR/install/setup.bash" ]]; then
+    source "$REPO_DIR/install/setup.bash"
+else
+    echo "ERROR: Vision workspace not built: $REPO_DIR/install/setup.bash"
+    exit 1
+fi
+
+# ============================================================
+# Display configuration
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "A*STAR Drone Vision Pipeline"
+echo "=========================================="
+echo "Timestamp:       $TIMESTAMP"
+echo "Map output:      $MAP_OUTPUT"
+echo "Mesh output:     $MESH_OUTPUT"
+echo "Normals output:  $NORMAL_OUTPUT"
+echo "Locked target:   $LOCKED_TARGET_FILE"
+echo "Path output:     $PATH_OUTPUT"
+
+# ============================================================
+# Ask whether to use previous normals
+# ============================================================
+
+USE_PREVIOUS_NORMAL=false
+
+if [[ -f "$LOCKED_TARGET_FILE" ]]; then
+    echo ""
+    echo "Previous normal target found: $LOCKED_TARGET_FILE"
+    read -r -p "Display previous normals? [y/N]: " PREVIOUS_NORMAL_REPLY
+
+    if [[ "$PREVIOUS_NORMAL_REPLY" =~ ^[Yy]$ ]]; then
+        USE_PREVIOUS_NORMAL=true
+        echo "Using previous normals."
+    else
+        echo "Using newly estimated normals."
+    fi
+else
+    echo ""
+    echo "No previous normal target found. New normals will be estimated."
+fi
+
+# ============================================================
+# Ask whether to generate a path
+# ============================================================
+
+GENERATE_PATH=false
+
+read -r -p "Generate an offset spline path? [y/N]: " GENERATE_PATH_REPLY
+
+if [[ "$GENERATE_PATH_REPLY" =~ ^[Yy]$ ]]; then
+    GENERATE_PATH=true
+    echo "Path generation enabled."
+else
+    echo "Path generation disabled."
+fi
+
+# ============================================================
+# 1. Launch Livox Mid-360
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[1/5] Starting Livox Mid-360 driver..."
+echo "=========================================="
+
+ros2 launch livox_ros_driver2 msg_MID360_launch.py &
+LIVOX_PID=$!
+
+sleep 3
+
+TOPIC_TYPE=$(ros2 topic type /livox/lidar 2>/dev/null || echo "unknown")
+if [[ "$TOPIC_TYPE" != *"PointCloud2"* ]]; then
+    echo "WARNING: /livox/lidar reports '$TOPIC_TYPE', expected sensor_msgs/PointCloud2."
+    echo "Check xfer_format = 0 in msg_MID360_launch.py"
+else
+    echo "Confirmed: /livox/lidar -> PointCloud2"
+fi
+
+# ============================================================
+# 2. Launch DLIO (rviz:=false -- we launch our own with the
+#    project's RViz config below)
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[2/5] Starting DLIO..."
+echo "=========================================="
+
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+    rviz:=false \
+    pointcloud_topic:=/livox/lidar \
+    imu_topic:=/livox/imu \
+    > "$DLIO_LOG" 2>&1 &
+
+DLIO_PID=$!
+echo "DLIO PID: $DLIO_PID"
+echo "DLIO log: $DLIO_LOG"
+
+# ============================================================
+# 2.5 Static TF: lidar -> livox_frame
+# ============================================================
+
+echo "[2.5/5] Starting static TF (lidar -> livox_frame)..."
+
+ros2 run tf2_ros static_transform_publisher \
+    0 0 0 0 0 0 lidar livox_frame &
+TF_PID=$!
+
+sleep 3
+
+# ============================================================
+# 3. Launch RViz2 with the project config
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[3/5] Starting RViz2..."
+echo "=========================================="
+
+if [[ -f "$RVIZ_CONFIG" ]]; then
+    echo "Using RViz config: $RVIZ_CONFIG"
+    ros2 run rviz2 rviz2 -d "$RVIZ_CONFIG" &
+else
+    echo "WARNING: RViz config not found: $RVIZ_CONFIG"
+    echo "Launching RViz2 with default configuration."
+    ros2 run rviz2 rviz2 &
+fi
+RVIZ_PID=$!
+
+# ============================================================
+# 4. Launch map pipeline
+#    NOTE: parameter is save_path, not output_pcd_path.
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[4/5] Starting map_pip_mocap_multinormals"
+echo "=========================================="
+
+ros2 run cloud_pipeline map_pip_mocap_multinormals \
+    --ros-args \
+    -p save_path:="$MAP_OUTPUT" \
+    -p voxel_leaf_size:=0.007 \
+    -p duplicate_distance:=0.005 \
+    -p sor_mean_k:=2000 \
+    -p collection_duration_sec:=10.0 \
+    -p mesh_path:="$MESH_OUTPUT" \
+    -p path_yaml:="$PATH_OUTPUT" \
+    -p generate_path:="$GENERATE_PATH" \
+    -p normals_save_path:="$NORMAL_OUTPUT" \
+    -p locked_target_path:="$LOCKED_TARGET_FILE" \
+    -p use_previous_normal:="$USE_PREVIOUS_NORMAL" \
+    > >(tee "$LOG_DIR/map_pip_${TIMESTAMP}.log") 2>&1 &
+
+MAP_PID=$!
+echo "map_pip_mocap_multinormals PID: $MAP_PID"
+
+# ============================================================
+# 5. Wait for the map file to appear (poll, don't block on
+#    process exit -- the node stays alive for normal selection)
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[5/5] Waiting for map..."
+echo "=========================================="
+echo "Waiting for: $MAP_OUTPUT"
+
+while [[ ! -f "$MAP_OUTPUT" ]]; do
+    if ! kill -0 "$MAP_PID" 2>/dev/null; then
+        echo ""
+        echo "ERROR: map_pip_mocap_multinormals exited before creating the map."
+        echo "Check log: $LOG_DIR/map_pip_${TIMESTAMP}.log"
+        exit 1
+    fi
+    echo "[wait] Map not ready yet..."
+    sleep 1
+done
+
+echo ""
+echo "Map successfully generated: $MAP_OUTPUT"
+
+# ============================================================
+# Mesh reconstruction
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "Generating mesh"
+echo "=========================================="
+
+if [[ ! -f "$MESH_RECONSTRUCT" ]]; then
+    echo "ERROR: Mesh reconstruction script not found: $MESH_RECONSTRUCT"
+    exit 1
+fi
+
+conda run -n lidar python "$MESH_RECONSTRUCT" \
+    "$MAP_OUTPUT" \
+    "$MESH_OUTPUT" \
+    --voxel 0.01 \
+    --orient sensor \
+    --poisson-depth 8 \
+    --keep-largest \
+    --remove-outliers \
+    --crop-to-input
+
+if [[ ! -f "$MESH_OUTPUT" ]]; then
+    echo "ERROR: Expected mesh was not generated: $MESH_OUTPUT"
+    exit 1
+fi
+
+echo "Mesh successfully generated: $MESH_OUTPUT"
+
+# ============================================================
+# Open mesh in MeshLab
+# ============================================================
+
+if command -v meshlab >/dev/null 2>&1; then
+    echo "Opening mesh in MeshLab..."
+    meshlab "$MESH_OUTPUT" &
+else
+    echo "WARNING: MeshLab was not found. Install with: sudo apt install meshlab"
+fi
+
+# ============================================================
+# PREVIOUS NORMAL BRANCH
+# ============================================================
+
+if [[ "$USE_PREVIOUS_NORMAL" == true ]]; then
+
+    echo ""
+    echo "=========================================="
+    echo "Previous normals: $LOCKED_TARGET_FILE"
+    echo "=========================================="
+
+    if [[ "$GENERATE_PATH" == true ]]; then
+
+	    TARGET_COUNT=$(count_targets "$LOCKED_TARGET_FILE")
+	    echo "Previous normal count: $TARGET_COUNT"
+
+	    if [[ "$TARGET_COUNT" -lt 2 ]]; then
+		echo "A path requires at least 2 normals. Path generation skipped."
+	    else
+		if [[ ! -f "$SPLINE_SCRIPT" ]]; then
+		    echo "ERROR: Spline script not found: $SPLINE_SCRIPT"
+		    exit 1
+		fi
+
+		echo "Generating offset spline..."
+
+		conda run -n lidar python "$SPLINE_SCRIPT" \
+		    "$LOCKED_TARGET_FILE" \
+		    "$MESH_OUTPUT" \
+		    -o "$PATH_OUTPUT" \
+		    --csv "$PATH_CSV" \
+		    --offset "$SPLINE_OFFSET" \
+		    --spacing "$SPLINE_SPACING" \
+		    --iterations "$SPLINE_ITERATIONS" \
+		    --smooth-start "$SPLINE_SMOOTH_START" \
+		    --smooth-end "$SPLINE_SMOOTH_END" \
+		    --order file \
+		    --side outward \
+		    --project-knots
+
+		if [[ ! -f "$PATH_OUTPUT" ]]; then
+		    echo "ERROR: Spline generation finished but no path was created: $PATH_OUTPUT"
+		    exit 1
+		fi
+
+		echo "Path successfully generated: $PATH_OUTPUT"
+		echo "CSV: $PATH_CSV"
+
+		echo ""
+		echo "Displaying generated path in RViz..."
+
+		if ! ros2 service call /load_and_publish_path std_srvs/srv/Trigger "{}"; then
+		    echo "WARNING: Failed to request path display."
+		else
+		    echo "Path display request sent to map pipeline."
+		fi
+	    fi
+
+	else
+	    echo "Path generation disabled. Skipping spline generation."
+	fi
+
+# ============================================================
+# NEW NORMAL SELECTION BRANCH
+# ============================================================
+
+else
+
+    echo ""
+    echo "=========================================="
+    echo "New normal selection"
+    echo "=========================================="
+    echo "Select normals in RViz, then return here and press ENTER."
+    echo ""
+    echo "Waiting for normal-selection service..."
+
+    while ! ros2 service list 2>/dev/null | grep -q "/finish_normal_selection"; do
+        if ! kill -0 "$MAP_PID" 2>/dev/null; then
+            echo "ERROR: map_pip_mocap_multinormals has exited."
+            exit 1
+        fi
+        sleep 1
+    done
+
+    echo
+	echo "=============================================="
+	echo "        NORMAL SELECTION CONTROLS"
+	echo "=============================================="
+	echo "Select normals in RViz."
+	echo
+	echo "  Backspace  = undo last normal"
+	echo "  Enter      = finish normal selection"
+	echo
+	echo "When using Backspace or Enter, first click this"
+	echo "terminal so that it has keyboard focus."
+	echo "=============================================="
+	echo
+
+	while true; do
+	    IFS= read -rsn1 key
+
+	    # Enter
+	    if [[ "$key" == "" ]]; then
+		echo
+		echo "Finishing normal selection..."
+
+		ros2 service call \
+		    /finish_normal_selection \
+		    std_srvs/srv/Trigger "{}"
+
+		break
+	    fi
+
+	    # Backspace
+	    if [[ "$key" == $'\x7f' ]]; then
+		echo
+		echo "Undoing last normal..."
+
+		ros2 service call \
+		    /undo_normal_selection \
+		    std_srvs/srv/Trigger "{}"
+
+		echo
+		echo "Backspace = undo | Enter = finish"
+	    fi
+	done
+
+    echo "Saving selected normals..."
+    if ! ros2 service call /finish_normal_selection std_srvs/srv/Trigger "{}"; then
+        echo "ERROR: Failed to finish normal selection."
+        exit 1
+    fi
+
+    if [[ ! -f "$NORMAL_OUTPUT" ]]; then
+        echo "ERROR: Selected-normal file was not generated: $NORMAL_OUTPUT"
+        exit 1
+    fi
+
+    echo "Selected normals saved: $NORMAL_OUTPUT"
+
+    read -r -p "Overwrite locked target with these normals? [y/N]: " OVERWRITE_REPLY
+    if [[ "$OVERWRITE_REPLY" =~ ^[Yy]$ ]]; then
+        cp "$NORMAL_OUTPUT" "$LOCKED_TARGET_FILE"
+        echo "Locked target updated: $LOCKED_TARGET_FILE"
+    else
+        echo "Locked target was not changed."
+    fi
+
+    TARGET_COUNT=$(count_targets "$NORMAL_OUTPUT")
+    echo "Selected normal count: $TARGET_COUNT"
+
+    if [[ "$TARGET_COUNT" -lt 2 ]]; then
+        echo "Only $TARGET_COUNT normal(s) selected. A path requires at least 2. Path generation skipped."
+    else
+        if [[ "$GENERATE_PATH" == true ]]; then
+            if [[ ! -f "$SPLINE_SCRIPT" ]]; then
+                echo "ERROR: Spline script not found: $SPLINE_SCRIPT"
+                exit 1
+            fi
+
+            echo "Generating offset spline..."
+            conda run -n lidar python "$SPLINE_SCRIPT" \
+                "$NORMAL_OUTPUT" \
+                "$MESH_OUTPUT" \
+                -o "$PATH_OUTPUT" \
+                --csv "$PATH_CSV" \
+                --offset "$SPLINE_OFFSET" \
+                --spacing "$SPLINE_SPACING" \
+                --iterations "$SPLINE_ITERATIONS" \
+                --smooth-start "$SPLINE_SMOOTH_START" \
+                --smooth-end "$SPLINE_SMOOTH_END" \
+                --order file \
+                --side outward \
+                --project-knots
+
+            if [[ ! -f "$PATH_OUTPUT" ]]; then
+                echo "ERROR: Spline generation finished but no path was created: $PATH_OUTPUT"
+                exit 1
+            fi
+
+            echo "Path successfully generated: $PATH_OUTPUT"
+            echo "CSV: $PATH_CSV"
+
+		echo ""
+		echo "Displaying generated path in RViz..."
+
+		if ! ros2 service call /load_and_publish_path std_srvs/srv/Trigger "{}"; then
+		    echo "WARNING: Failed to request path display."
+		else
+		    echo "Path display request sent to map pipeline."
+		fi
+        else
+            echo "Path generation skipped."
+        fi
+    fi
+fi
+
+# ============================================================
+# Final summary
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "Pipeline complete"
+echo "=========================================="
+echo "Timestamp: $TIMESTAMP"
+echo "Map:       $MAP_OUTPUT"
+echo "Mesh:      $MESH_OUTPUT"
+
+if [[ "$USE_PREVIOUS_NORMAL" == true ]]; then
+    echo "Normal source: $LOCKED_TARGET_FILE"
+else
+    echo "Normal source: $NORMAL_OUTPUT"
+fi
+
+if [[ -f "$PATH_OUTPUT" ]]; then
+    echo "Generated path: $PATH_OUTPUT"
+    echo "Generated path CSV: $PATH_CSV"
+else
+    echo "Generated path: None"
+fi
+
+echo ""
+echo "Livox / DLIO / RViz / map pipeline are still running."
+echo "Press Ctrl-C to shut everything down."
+
+wait
