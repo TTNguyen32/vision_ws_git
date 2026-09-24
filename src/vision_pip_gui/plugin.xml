@@ -1,0 +1,15 @@
+<library path="vision_pip_gui">
+  <class name="vision_pip_gui/PipelinePanel"
+         type="vision_pip_gui.pipeline_panel.PipelinePanel"
+         base_class_type="rqt_gui_py::Plugin">
+    <description>Control panel for the A*STAR vision pipeline.</description>
+    <qtgui>
+      <group>
+        <label>Vision Pipeline</label>
+      </group>
+      <label>Pipeline Control</label>
+      <icon type="theme">media-record</icon>
+      <statustip>Collection, normal selection, path and mesh control.</statustip>
+    </qtgui>
+  </class>
+</library>
