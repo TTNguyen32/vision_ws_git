@@ -1,704 +1,382 @@
-# Cloud Mapping Pipeline
+# vision_ws_git — A*STAR Drone Vision Pipeline
 
-A ROS 2-based LiDAR mapping pipeline for collecting, processing, and reconstructing 3D point clouds using a **Livox Mid-360**, **Direct LiDAR-Inertial Odometry (DLIO)**, and custom cloud-processing nodes.
-
-The pipeline is designed to produce a globally aligned point-cloud map, estimate surface normals, identify and lock target contact points, and reconstruct the resulting point cloud as a 3D mesh.
+A ROS 2 (Humble) LiDAR mapping pipeline for collecting, processing, and reconstructing 3D point clouds, and for selecting tree-contact normals and generating a UAV inspection path from them. Supports two pose sources — **DLIO** (LiDAR-inertial odometry, via a **Livox Mid-360**) and **OptiTrack** motion capture — sharing the same downstream mapping, meshing, normal-selection, and path-generation stages.
 
 ---
 
 ## Overview
 
-The system combines LiDAR, inertial odometry, point-cloud processing, and mesh reconstruction into a single pipeline.
-
 ```text
-                         Livox Mid-360
-                         LiDAR + IMU
-                              │
-                ┌─────────────┴─────────────┐
-                │                           │
-                ▼                           ▼
-         /livox/lidar                 /livox/imu
-                │                           │
-                └─────────────┬─────────────┘
-                              ▼
-                             DLIO
-                  Direct LiDAR-Inertial
-                         Odometry
-                              │
-                ┌─────────────┴─────────────┐
-                │                           │
-                ▼                           ▼
-          Odometry                  Deskewed cloud
-                │                           │
-                └─────────────┬─────────────┘
-                              ▼
-                       cloud_pipeline
-                              │
-                ┌─────────────┴─────────────┐
-                │                           │
-                ▼                           ▼
-           Global map                 Surface normals
-             (.pcd)                         │
-                                            ▼
-                                     Locked target
-                                            │
-                                            ▼
-                                      Mesh reconstruction
-                                            │
-                                            ▼
-                                          (.stl)
+   Livox Mid-360 (LiDAR + IMU)                OptiTrack (rigid body: Tin_LIDAR)
+            │                                            │
+            ▼                                            ▼
+          DLIO                              optitrack_packages_ros2
+  (odometry, deskewing, pose)          (fork: src/optitrack_packages_ros2,
+            │                           submodule — see docs/optitrack_setup.md)
+            │                                            │
+            ▼                                            ▼
+map_pip_dlio_multinormals          map_pip_optitrack_tf  /  map_pip_optitrack_slerp
+            │                                            │
+            └────────────────────┬───────────────────────┘
+                                  ▼
+                       Point-cloud accumulation
+                (voxel filter, duplicate removal,
+                      statistical outlier removal)
+                                  │
+                                  ▼
+                        Global map (.pcd)
+                                  │
+                    ┌─────────────┴─────────────┐
+                    ▼                           ▼
+              Mesh (Poisson)              Surface normals
+      scripts/lidar-tools/pcd_to_stl.py         │
+                    │                            ▼
+                    │              Interactive normal selection (RViz clicks)
+                    │                            │
+                    │                      locked_target.yaml
+                    │                            │
+                    └────────────┬───────────────┘
+                                  ▼
+                      Path generation (offset_spline.py)
+                                  │
+                                  ▼
+                          UAV inspection path
 ```
 
-The complete system can be launched using a single script.
+Collection, mesh generation, normal selection, and path generation are controlled through **`vision_pip_gui`**, an rqt panel (`src/vision_pip_gui/`). Shell pane scripts (`scripts/collect.sh`, `mesh.sh`, `select.sh`, `path.sh`) are kept as the reference implementation the GUI is ported from, and remain usable standalone.
 
 ---
 
-## Repository Structure
+## Repository structure
 
 ```text
 vision_ws_git/
 ├── README.md
 │
 ├── config/
-│   └── map_pip.rviz
+│   ├── map_pip.rviz                    # DLIO RViz layout
+│   ├── map_pip_optitrack.rviz          # OptiTrack RViz layout
+│   └── optitrack/                      # reference copies of the fork's config
+│       ├── optitrack_multiplexer_config.yaml
+│       ├── optitrack_wrapper_config.yaml
+│       └── wrapper_and_multiplexer.launch.py
 │
 ├── docs/
 │   ├── livox_mid360_setup.md
-│   └── dlio_setup.md
+│   ├── dlio_setup.md
+│   └── optitrack_setup.md              # network, naming, submodule workflow, debugging notes
 │
 ├── scripts/
-│   ├── pcd_to_stl.py
-│   └── run_mid360_dlio_mappipmocap-poisson.sh
+│   ├── common.sh                       # shared paths/helpers, sourced by every pane script
+│   ├── collect.sh  mesh.sh  select.sh  path.sh
+│   ├── load_params.py                  # pipeline_params.yaml -> CLI args (shell + node modes)
+│   ├── pipeline_params.yaml            # every tunable: node, mesh (live/final), path
+│   ├── run_vision_pip_dlio
+│   ├── run_vision_pip_optitrack_tf         # LIDAR_EXT = 0,0,0
+│   ├── run_vision_pip_optitrack_slerp
+│   ├── run_vision_pip_optitrack_naive.sh   # pre-pane fallback, documented not deleted
+│   ├── test_mesh.sh  test_path.sh          # standalone tuning harnesses, hardcoded paths
+│   └── lidar-tools/
+│       ├── pcd_to_stl.py               # PCD -> STL (Poisson / BPA / alpha / delaunay)
+│       ├── offset_spline.py            # normals + mesh -> standoff path
+│       ├── tf_displacement.py          # TF-edge displacement diagnostics
+│       └── setup.sh                    # one-time `lidar` conda env bootstrap
 │
 └── src/
-    └── cloud_pipeline/
-        ├── CMakeLists.txt
-        ├── package.xml
-        └── src/
-            ├── map_pip.cpp
-            └── map_pip_mocap.cpp
+    ├── cloud_pipeline/                 # C++ nodes (ament_cmake)
+    │   ├── CMakeLists.txt
+    │   ├── package.xml
+    │   └── src/
+    │       ├── map_pip.cpp  map_pip_mocap.cpp  map_pip_mocap_normals.cpp
+    │       ├── map_pip_dlio_multinormals.cpp  map_pip_dlio_multinormals_test.cpp
+    │       ├── map_pip_optitrack_slerp.cpp  map_pip_optitrack_tf.cpp
+    │       └── mocap_tf_broadcaster.cpp    # RViz-visualization-only TF bridge
+    │
+    ├── vision_pip_gui/                 # rqt panel (ament_python)
+    │   ├── package.xml  plugin.xml  setup.py  setup.cfg
+    │   └── vision_pip_gui/
+    │       ├── pipeline_panel.py  common.py  services.py  tools.py  mesh_watcher.py
+    │
+    └── optitrack_packages_ros2/        # git submodule -> fork, project-specific config
 ```
 
 ---
 
 ## Hardware
 
-The current system uses:
+- **Livox Mid-360 LiDAR** with built-in IMU, Ethernet-connected.
+- **OptiTrack** motion capture, tracking a rigid body registered in Motive as `Tin_LIDAR`.
 
-- **Livox Mid-360 LiDAR**
-- Built-in IMU
-- Ethernet connection between the LiDAR and computer
+Livox and OptiTrack sit on different subnets (`192.168.1.x` and `192.168.50.x` respectively) and conflict on a single NIC — run both via two separate Ethernet adapters, one static-IP'd per subnet.
 
-The Mid-360's LiDAR and IMU measurements are used together by DLIO to estimate the sensor trajectory and produce deskewed point clouds.
-
-For detailed hardware and driver setup, see:
+Detailed setup:
 
 - [`docs/livox_mid360_setup.md`](docs/livox_mid360_setup.md)
 - [`docs/dlio_setup.md`](docs/dlio_setup.md)
+- [`docs/optitrack_setup.md`](docs/optitrack_setup.md)
 
 ---
 
-## Software Requirements
+## Software requirements
 
-The pipeline has been developed and tested with:
+- Ubuntu 22.04, ROS 2 Humble
+- Livox ROS Driver 2, Direct LiDAR-Inertial Odometry (DLIO)
+- `optitrack_packages_ros2` (submodule, see Setup below)
+- PCL, Eigen3, yaml-cpp
+- `rqt_gui`, `rqt_gui_py`, `python_qt_binding` (for `vision_pip_gui`)
+- Python 3, plus a `lidar` conda environment (Open3D, NumPy) for `scripts/lidar-tools/`
+- MeshLab (optional, for viewing `.stl` output)
 
-- Ubuntu 22.04
-- ROS 2 Humble
-- Livox ROS Driver 2
-- Direct LiDAR-Inertial Odometry (DLIO)
-- PCL
-- Python 3
-- MeshLab
-
-The system uses three ROS 2 workspaces:
-
-```text
-~/livox_ws
-~/dlio_ws
-~/vision_ws_git
-```
-
-### Workspace roles
+Three ROS 2 workspaces:
 
 | Workspace | Purpose |
 |---|---|
 | `~/livox_ws` | Livox ROS 2 driver |
 | `~/dlio_ws` | Direct LiDAR-Inertial Odometry |
-| `~/vision_ws_git` | This project's cloud-processing pipeline |
+| `~/vision_ws_git` | This project — `cloud_pipeline`, `vision_pip_gui`, and the OptiTrack submodule |
 
 ---
 
-## Installation
+## Setup
 
-### 1. Install ROS 2 Humble
-
-Install ROS 2 Humble on Ubuntu 22.04 and ensure that the following works:
+### 1. ROS 2 Humble
 
 ```bash
 source /opt/ros/humble/setup.bash
 ros2 --version
 ```
 
----
+### 2. Livox ROS 2 driver
 
-### 2. Install the Livox ROS 2 driver
+Maintained in `~/livox_ws` — see [`docs/livox_mid360_setup.md`](docs/livox_mid360_setup.md). The Mid-360 launch config must use `xfer_format = 0`, so `/livox/lidar` publishes a standard `sensor_msgs/PointCloud2` rather than Livox's custom message type.
 
-The Livox driver is maintained in a separate workspace:
+### 3. DLIO
 
-```text
-~/livox_ws
-```
+Maintained in `~/dlio_ws` — see [`docs/dlio_setup.md`](docs/dlio_setup.md). Expects `/livox/lidar` and `/livox/imu` as input.
 
-See:
-
-[`docs/livox_mid360_setup.md`](docs/livox_mid360_setup.md)
-
-for the complete installation and configuration procedure.
-
-For this project, the Mid-360 launch configuration must use:
-
-```python
-xfer_format = 0
-```
-
-This makes `/livox/lidar` publish a standard:
-
-```text
-sensor_msgs/PointCloud2
-```
-
-message rather than Livox's custom point-cloud message format.
-
----
-
-### 3. Install DLIO
-
-DLIO is maintained in:
-
-```text
-~/dlio_ws
-```
-
-See:
-
-[`docs/dlio_setup.md`](docs/dlio_setup.md)
-
-for installation and configuration instructions.
-
-The project expects DLIO to provide:
-
-```text
-/livox/lidar
-/livox/imu
-```
-
-as its input topics.
-
----
-
-### 4. Build this project
-
-Clone the repository:
+### 4. Clone this repository (with the OptiTrack submodule)
 
 ```bash
 cd ~
-git clone https://github.com/TTNguyen32/vision_ws_git.git
+git clone --recurse-submodules https://github.com/TTNguyen32/vision_ws_git.git
+cd vision_ws_git
 ```
 
-Enter the workspace:
+Already cloned without `--recurse-submodules`?
 
 ```bash
-cd ~/vision_ws_git
+git submodule update --init
 ```
 
-Source ROS 2:
+The submodule is a fork of [`lis-epfl/optitrack_packages_ros2`](https://github.com/lis-epfl/optitrack_packages_ros2) with project-specific config (rigid body name, world frame, server address) committed directly in it — see [`docs/optitrack_setup.md`](docs/optitrack_setup.md) for the update workflow.
+
+### 5. `lidar-tools` conda environment
 
 ```bash
+scripts/lidar-tools/setup.sh
+```
+
+### 6. Build
+
+**Deactivate conda first** — `colcon`/`cmake` need system Python (which has ROS's apt-installed dependencies like `catkin_pkg` and `PyYAML`); an active conda base env shadows `python3` on `PATH` and breaks the build with `ModuleNotFoundError`.
+
+```bash
+conda deactivate
 source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-up-to cloud_pipeline vision_pip_gui
+source install/setup.bash
 ```
 
-Build:
+`--packages-up-to`, not `--packages-select` — `cloud_pipeline` depends on message packages generated inside the `optitrack_packages_ros2` submodule, and `--packages-up-to` resolves the full dependency graph from every package's `package.xml` in one pass. `--symlink-install` matters especially for `vision_pip_gui`, a pure-Python package — edits to its `.py` files take effect without a rebuild.
+
+Verify:
 
 ```bash
-colcon build --symlink-install
-```
-
-Then source the workspace:
-
-```bash
-source ~/vision_ws_git/install/setup.bash
-```
-
-Verify that the package is available:
-
-```bash
-ros2 pkg list | grep cloud_pipeline
-```
-
-Expected output:
-
-```text
-cloud_pipeline
+ros2 pkg list | grep -E 'cloud_pipeline|vision_pip_gui'
 ```
 
 ---
 
-# Configuration
+## Configuration
 
-## Livox Point Cloud Format
+### Livox point-cloud format
 
-The Livox Mid-360 launch file must use:
+`~/livox_ws/src/livox_ros_driver2/launch_ROS2/msg_MID360_launch.py` must set `xfer_format = 0`. Check with:
 
-```python
-xfer_format = 0
+```bash
+ros2 topic type /livox/lidar   # expect sensor_msgs/msg/PointCloud2
 ```
 
-This is important because the mapping pipeline expects:
-
-```text
-/livox/lidar
-    sensor_msgs/PointCloud2
-```
-
-The launch file is located in the Livox workspace:
-
-```text
-~/livox_ws/src/livox_ros_driver2/launch_ROS2/msg_MID360_launch.py
-```
-
----
-
-## ROS Topics
-
-The main topics used by the pipeline are:
+### ROS topics
 
 | Topic | Message type | Purpose |
 |---|---|---|
 | `/livox/lidar` | `sensor_msgs/PointCloud2` | Raw Mid-360 point cloud |
 | `/livox/imu` | IMU message | Mid-360 IMU measurements |
 | `/dlio/odom_node/pose` | `geometry_msgs/PoseStamped` | DLIO pose |
-| `/odom` | `nav_msgs/Odometry` | DLIO odometry |
-| `/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | Deskewed/globalised point cloud |
+| `/dlio/odom_node/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | Deskewed cloud (DLIO path) |
+| `/optitrack_multiplexer_node/rigid_body/Tin_LIDAR` | `RigidBodyStamped` | Mocap pose (OptiTrack path) |
+| `/global_map` | `sensor_msgs/PointCloud2` | Accumulated global map |
+| `/processed/mesh` | `visualization_msgs/MarkerArray` | Live/final mesh, in RViz |
+| `/processed/selected_normals`, `/processed/path` | — | Selected contact normals, generated path |
 
-The mapping pipeline primarily uses DLIO's deskewed point cloud and odometry information to accumulate the global map.
+### RViz
+
+- DLIO: `config/map_pip.rviz`
+- OptiTrack: `config/map_pip_optitrack.rviz`
+
+### Tuning
+
+All node/mesh/path parameters live in `scripts/pipeline_params.yaml`, read once at launch:
+
+```bash
+PARAMS_FILE=~/experiments/deep_mesh.yaml scripts/run_vision_pip_dlio
+```
 
 ---
 
-## RViz Configuration
+## Running
 
-The saved RViz2 configuration is stored at:
-
-```text
-config/map_pip.rviz
+```bash
+scripts/run_vision_pip_dlio              # DLIO pose source
+scripts/run_vision_pip_optitrack_tf      # OptiTrack, TF lookup + mocap_tf_broadcaster
+scripts/run_vision_pip_optitrack_slerp   # OptiTrack, buffered pose interpolation
 ```
 
-The main launch script automatically loads this configuration.
+Then, the control panel:
 
-If the configuration is missing, the script will fall back to launching RViz2 with its default configuration.
+```bash
+ros2 run rqt_gui rqt_gui
+# Plugins -> Vision Pipeline
+```
+
+Start/end collection, undo/save/load/clear normals, and generate/publish a path all happen from the panel. RViz clicks select normals; the panel's buttons drive everything else via `std_srvs/Trigger` service calls to the running node.
 
 ---
 
-# Running the Pipeline
+## Target-normal workflow
 
-The recommended way to run the complete system is through the provided launch script.
-
-First, enter the repository:
-
-```bash
-cd ~/vision_ws_git
-```
-
-Make sure the script is executable:
-
-```bash
-chmod +x scripts/run_mid360_dlio_mappipmocap-poisson.sh
-```
-
-Then run:
-
-```bash
-./scripts/run_mid360_dlio_mappipmocap-poisson.sh
-```
-
-The script automatically sources the required workspaces:
+Selected normals are saved via the panel's Save button (or `select.sh`'s Enter key), with an option to overwrite the persistent `locked_target.yaml`. On a later run, Load pulls the locked set back into the current selection — useful when re-scanning the same physical setup where the previous contact points remain valid.
 
 ```text
-/opt/ros/humble
-~/livox_ws
-~/dlio_ws
-~/vision_ws_git
+run 1 → select normals → Save (+ overwrite locked target) → locked_target.yaml
+run 2 → Load locked target → reuse contact targets
 ```
-
-It then starts the pipeline in sequence:
-
-1. Livox Mid-360 driver
-2. LiDAR topic verification
-3. Previous target-normal check
-4. DLIO
-5. Static TF transform
-6. RViz2
-7. `cloud_pipeline`
-8. Map collection
-9. Mesh reconstruction
-10. MeshLab
 
 ---
 
-# Output Files
+## Output files
 
-Pipeline outputs are stored outside the Git repository in:
-
-```text
-~/vision_ws_outputs/
-```
-
-The directory structure is:
+Stored outside git, in `~/vision_ws_outputs/`:
 
 ```text
 vision_ws_outputs/
-├── maps/
-├── meshes/
-├── normals/
-└── logs/
-```
-
-### Maps
-
-Accumulated point clouds are saved in:
-
-```text
-~/vision_ws_outputs/maps/
-```
-
-Each run receives a timestamped filename:
-
-```text
-global_map_YYYYMMDD_HHMMSS.pcd
-```
-
-For example:
-
-```text
-global_map_20260828_153012.pcd
-```
-
-### Meshes
-
-Reconstructed meshes are stored in:
-
-```text
-~/vision_ws_outputs/meshes/
-```
-
-with timestamped filenames:
-
-```text
-map_YYYYMMDD_HHMMSS.stl
-```
-
-### Normals
-
-Persisted target-normal information is stored in:
-
-```text
-~/vision_ws_outputs/normals/
-```
-
-The currently used file is:
-
-```text
-locked_target.yaml
-```
-
-This allows a previously selected target normal to be reused in subsequent runs when the user confirms that the setup is unchanged.
-
-### Logs
-
-DLIO logs are stored in:
-
-```text
-~/vision_ws_outputs/logs/
-```
-
-Each run creates a timestamped log:
-
-```text
-dlio_YYYYMMDD_HHMMSS.log
+├── latest -> run_YYYYMMDD_HHMMSS/     # symlink to the current/most recent run
+└── run_YYYYMMDD_HHMMSS/
+    ├── maps/     global_map_<ts>.pcd, snapshot_NNNNN.pcd
+    ├── meshes/   map_<ts>.stl, live_NNNNN.stl
+    ├── normals/  selected_normals_<ts>.yaml
+    ├── paths/    path_<ts>.yaml, path_<ts>.csv
+    ├── logs/     mesh.log, path.log
+    └── params.yaml   # pipeline_params.yaml snapshot for this run
+locked_target.yaml    # persistent, reused across runs
 ```
 
 ---
 
-# Target Normal Workflow
+## Mesh reconstruction
 
-The pipeline supports saving and reusing a previously selected target normal.
-
-During startup, the system checks:
-
-```text
-~/vision_ws_outputs/normals/locked_target.yaml
-```
-
-If a previous target exists, the user is asked whether it should be reused.
-
-If the user chooses:
-
-```text
-y
-```
-
-the previous target normal is used.
-
-Otherwise, a new normal is estimated from the newly collected map.
-
-This is useful when repeatedly scanning the same physical setup and the previously established target frame remains valid.
-
----
-
-# Mesh Reconstruction
-
-After the global point cloud has been saved, the pipeline automatically runs:
-
-```text
-scripts/pcd_to_stl.py
-```
-
-The current reconstruction configuration uses Poisson surface reconstruction with:
-
-```text
-voxel size:       0.01
-orientation:      sensor
-Poisson depth:    8
-keep largest:     enabled
-remove outliers:  enabled
-crop to input:    enabled
-```
-
-The command is equivalent to:
+Driven by `pipeline_params.yaml`'s `mesh.live` / `mesh.final` sections (live: fast, runs every snapshot during collection; final: quality, runs once after collection ends), via:
 
 ```bash
-python3 scripts/pcd_to_stl.py \
-    input.pcd \
-    output.stl \
-    --voxel 0.01 \
-    --orient sensor \
-    --poisson-depth 8 \
-    --keep-largest \
-    --remove-outliers \
-    --crop-to-input
+scripts/lidar-tools/pcd_to_stl.py
 ```
 
-The resulting STL file can be opened automatically in MeshLab if MeshLab is installed.
-
----
-
-# Troubleshooting
-
-## `/livox/lidar` is not `PointCloud2`
-
-Check the Livox Mid-360 launch file:
-
-```text
-~/livox_ws/src/livox_ros_driver2/launch_ROS2/msg_MID360_launch.py
-```
-
-Ensure:
-
-```python
-xfer_format = 0
-```
-
-You can check the topic type with:
+Can be run standalone for tuning:
 
 ```bash
-ros2 topic type /livox/lidar
-```
-
-Expected:
-
-```text
-sensor_msgs/msg/PointCloud2
+python3 scripts/lidar-tools/pcd_to_stl.py --help
 ```
 
 ---
 
-## DLIO does not start
+## Troubleshooting
 
-Check that the Livox driver is publishing:
+**`/livox/lidar` is not `PointCloud2`** — check `xfer_format = 0` in the Mid-360 launch file; confirm with `ros2 topic type /livox/lidar`.
 
-```bash
-ros2 topic list | grep livox
-```
+**DLIO does not start** — check the Livox driver is publishing: `ros2 topic list | grep livox`, then `ros2 topic type /livox/lidar` / `/livox/imu`.
 
-Then check:
+**DLIO topics are missing** — `ros2 topic list | grep dlio`; expect `/dlio/odom_node/pointcloud/deskewed`.
 
-```bash
-ros2 topic type /livox/lidar
-ros2 topic type /livox/imu
-```
+**OptiTrack topic has a publisher but zero messages** — `rigid_body_names` in `optitrack_multiplexer_config.yaml` must match Motive's registered rigid-body name *exactly*; a mismatch produces a connected-but-silent topic with no error. Confirm the real name via a data-descriptions service call.
 
-The LiDAR topic should be:
+**RViz shows no point cloud** — check the TF tree (`ros2 run tf2_tools view_frames`) and the cloud's actual frame (`ros2 topic echo /dlio/odom_node/pointcloud/deskewed --once`) against RViz's fixed frame.
 
-```text
-sensor_msgs/msg/PointCloud2
-```
+**`colcon build` fails with `ModuleNotFoundError: No module named 'catkin_pkg'`** (or `'yaml'`) — an active conda environment is shadowing system Python on `PATH`. Run `conda deactivate` before building or running anything through `ros2`/`colcon`.
 
----
+**`ros2 run cloud_pipeline <exe>` can't find the executable after a rename** — check `project(...)` at the top of `CMakeLists.txt` matches `package.xml`'s `<name>`; `install(TARGETS ... DESTINATION lib/${PROJECT_NAME})` resolves from `project()`, independently of `package.xml`.
 
-## DLIO topics are missing
+**A clean clone fails to build `cloud_pipeline`** — known issue, `map_pip_mocap_normals.cpp` / `map_pip_dlio_multinormals_test.cpp` not yet reliably tracked/pushed; see `docs/optitrack_setup.md`.
 
-Check:
-
-```bash
-ros2 topic list | grep dlio
-```
-
-and:
-
-```bash
-ros2 topic list | grep pointcloud
-```
-
-The main expected mapping output is:
-
-```text
-/pointcloud/deskewed
-```
+Full debugging log from the DLIO → OptiTrack/rqt migration: [`docs/optitrack_setup.md`](docs/optitrack_setup.md).
 
 ---
 
-## RViz2 shows no point cloud
-
-Check the active TF tree:
-
-```bash
-ros2 run tf2_tools view_frames
-```
-
-Also check the frame of the point cloud:
-
-```bash
-ros2 topic echo /pointcloud/deskewed --once
-```
-
-The fixed frame in RViz2 must be compatible with the published point-cloud frame.
-
----
-
-## Mesh reconstruction fails
-
-Check that the reconstruction script exists:
-
-```bash
-ls -l ~/vision_ws_git/scripts/pcd_to_stl.py
-```
-
-Check Python:
-
-```bash
-python3 --version
-```
-
-The script can also be tested independently:
-
-```bash
-python3 scripts/pcd_to_stl.py --help
-```
-
----
-
-# Development
-
-The ROS 2 package is located at:
-
-```text
-src/cloud_pipeline/
-```
-
-After modifying the source code, rebuild with:
+## Development
 
 ```bash
 cd ~/vision_ws_git
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install
+colcon build --symlink-install --packages-up-to cloud_pipeline vision_pip_gui
 source install/setup.bash
 ```
 
-Check the working tree:
-
 ```bash
 git status
-```
-
-Before committing changes, it is useful to check for whitespace errors:
-
-```bash
-git diff --check
+git diff --check       # whitespace errors before committing
 ```
 
 ---
 
-# Git Workflow
-
-The repository uses `main` as its primary branch.
-
-Typical workflow:
+## Git workflow
 
 ```bash
 cd ~/vision_ws_git
-
 git status
-
-git add .
+git add <files>
+git diff --cached       # read it before committing
 git commit -m "Describe the change"
-
-git push
+git push origin HEAD    # not a hardcoded branch name — avoids branch-name mismatches
 ```
 
-Generated build files and local experiment outputs are excluded using `.gitignore`.
+`build/`, `install/`, `log/`, `vision_ws_outputs/` should be excluded via `.gitignore` — verify with `git ls-files | grep -E '^(build|install|log)/'` (should print nothing).
 
-In particular:
+The `optitrack_packages_ros2` submodule is a separate repository — config changes there need their own commit + push before the outer repo's gitlink is updated:
 
-```text
-build/
-install/
-log/
-vision_ws_outputs/
+```bash
+cd src/optitrack_packages_ros2
+git add -A && git commit -m "..." && git push origin HEAD
+cd ../..
+git add src/optitrack_packages_ros2
+git commit -m "Pin optitrack_packages_ros2 submodule to <what changed>"
 ```
 
-are not committed to the repository.
+---
+
+## Documentation
+
+- [`docs/livox_mid360_setup.md`](docs/livox_mid360_setup.md) — Livox hardware/driver setup
+- [`docs/dlio_setup.md`](docs/dlio_setup.md) — DLIO setup
+- [`docs/optitrack_setup.md`](docs/optitrack_setup.md) — network/naming, fork+submodule workflow, build dependency ordering, debugging notes
 
 ---
 
-# Documentation
+## Project status
 
-Additional setup documentation is available in the `docs/` directory:
-
-- **Livox Mid-360:** [`docs/livox_mid360_setup.md`](docs/livox_mid360_setup.md)
-- **DLIO:** [`docs/dlio_setup.md`](docs/dlio_setup.md)
-
-These documents contain the detailed peripheral installation and configuration instructions, while this README provides the overall project workflow.
-
----
-
-# Project Status
-
-The current pipeline supports:
-
-- Livox Mid-360 LiDAR input
-- Mid-360 built-in IMU input
-- DLIO LiDAR-inertial odometry
-- Deskewed point-cloud accumulation
-- Global map generation
-- Surface normal estimation
-- Target normal selection and persistence
-- Previous normal reuse
-- Poisson mesh reconstruction
-- STL output
-- Automatic MeshLab visualisation
-- Timestamped experiment outputs
-- Separate logging and output directories
-
----
+- DLIO and OptiTrack pose sources, both feeding the same mapping/meshing/normal-selection/path pipeline
+- Live and final mesh reconstruction (Poisson), interactive multi-normal selection with undo, locked-target persistence
+- `vision_pip_gui` rqt panel controlling collection, selection, and path generation
+- **Known issue:** clean-clone build currently fails (see Troubleshooting) — fix pending
 
 ## License
 
@@ -707,5 +385,4 @@ Add the appropriate project license here if/when one is selected.
 ## Author
 
 **Thanh Tin Nguyen**
-
 Cambridge University | ttn32@cam.ac.uk
