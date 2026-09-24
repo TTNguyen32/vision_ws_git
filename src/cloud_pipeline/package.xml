@@ -5,7 +5,7 @@
 
   <description>
     Point cloud accumulation, filtering, normal estimation,
-    segmentation, cylinder fitting, Poisson mesh generation and clicked-target selection
+    segmentation, cylinder fitting, and clicked-target selection
     for the APhI drone contact-point pipeline.
   </description>
 
@@ -24,6 +24,10 @@
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <!-- OptiTrack bridge (mocap2ros2/optitrack_packages_ros2) -->
+  <depend>optitrack_multiplexer_ros2_msgs</depend>
 
   <!-- TF2 -->
   <depend>tf2</depend>
