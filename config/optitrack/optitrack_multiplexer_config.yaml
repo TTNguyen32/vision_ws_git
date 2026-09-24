@@ -1,0 +1,30 @@
+# REFERENCE COPY ONLY — the live file lives in the optitrack_packages_ros2 fork
+# (src/optitrack_packages_ros2), edit it there and push to the fork, not here.
+# name of the node specified in the launch file.
+# if the "name" is not specified in the launch file, this would be the default name specified in the constructor
+optitrack_multiplexer_node:
+  ros__parameters:
+    # names of the topic on which the frame data is transmitted
+    topic_frame_data: "/optitrack_wrapper_node/frame_data"
+    # data descriptions service name 
+    data_descriptions_service_name: "/optitrack_wrapper_node/get_data_descriptions"
+    # names of the rigid bodies we want to stream; 
+    # no spaces in the name (I remove all the spaces in the 
+    # string before I process it), separate using underscore;
+    # the names should be seperated by a comma (", " also works)
+    rigid_body_names: "Tin_LIDAR"
+    # names of the skeletons we want to stream;
+    # no spaces in the name (I remove all the spaces in the 
+    # string before I process it), separate using underscore;
+    # the names should be seperated by a comma (", " also works)
+    skeleton_names: "SkeletonRos"
+    # publish markers that are not in a marker set (rigid body or skeleton)
+    publish_unlabeled_markers: true  
+    # topic of unlabeled markers to publish on
+    topic_unlabeled_markers: "unlabeled_markers"
+    # verbose metrics 
+    verbose: false
+    # publish ros2 tf
+    publish_tf: true
+    # world frame to publish the ros2 tf into
+    world_frame: "world"
