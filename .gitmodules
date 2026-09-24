@@ -1,0 +1,3 @@
+[submodule "src/optitrack_packages_ros2"]
+	path = src/optitrack_packages_ros2
+	url = https://github.com/TTNguyen32/optitrack_packages_ros2
