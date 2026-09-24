@@ -261,7 +261,7 @@ echo "=========================================="
 echo "[5/6] Starting map_pip_mocap_multinormals_test..."
 echo "=========================================="
 
-ros2 run cloud_accumulator map_pip_dlio_multinormals_test \
+ros2 run cloud_pipeline map_pip_dlio_multinormals_test \
     --ros-args \
     --params-file "$NODE_PARAMS" \
     -p output_dir:="$OUTPUT_DIR" \

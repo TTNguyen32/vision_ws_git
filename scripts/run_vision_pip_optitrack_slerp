@@ -36,7 +36,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 # common.sh points RVIZ_CONFIG at the DLIO config (fixed frame odom).
 # The mocap map lives in "world", so use the OptiTrack config instead.
-RVIZ_CONFIG="${OPTITRACK_RVIZ_CONFIG:-$WORKSPACE/src/cloud_accumulator/src/map_pip_optitrack.rviz}"
+RVIZ_CONFIG="${OPTITRACK_RVIZ_CONFIG:-$SCRIPT_DIR/../config/map_pip_optitrack.rviz}"
 
 # ============================================================
 # OptiTrack configuration
@@ -101,7 +101,7 @@ cp "$PARAMS_FILE" "$PARAMS_SNAPSHOT"
 export PARAMS_FILE="$PARAMS_SNAPSHOT"
 
 # A ROS 2 params file only applies to the node named by its top-level
-# key. This node is "map_pip_optitrack", not "cloud_accumulator", so a
+# key. This node is "map_pip_optitrack", not "cloud_pipeline", so a
 # file keyed to the old name would be silently ignored and every
 # pipeline tunable would fall back to its C++ default.
 NODE_KEY=$(grep -m1 -E '^[^[:space:]#][^:]*:' "$NODE_PARAMS" | cut -d: -f1 || true)
@@ -284,8 +284,8 @@ else
 fi
 
 # RViz-only. Skipped (not fatal) if the executable isn't built yet.
-if ros2 pkg executables cloud_accumulator 2>/dev/null | grep -qw mocap_tf_broadcaster; then
-    ros2 run cloud_accumulator mocap_tf_broadcaster \
+if ros2 pkg executables cloud_pipeline 2>/dev/null | grep -qw mocap_tf_broadcaster; then
+    ros2 run cloud_pipeline mocap_tf_broadcaster \
         --ros-args \
         -p mocap_rigid_body:="$MOCAP_RIGID_BODY" \
         -p world_frame:="$MOCAP_WORLD_FRAME" \
@@ -343,7 +343,7 @@ echo "=========================================="
 echo "[5/6] Starting map_pip_optitrack_slerp..."
 echo "=========================================="
 
-ros2 run cloud_accumulator map_pip_optitrack_slerp \
+ros2 run cloud_pipeline map_pip_optitrack_slerp \
     --ros-args \
     --params-file "$NODE_PARAMS" \
     -p output_dir:="$OUTPUT_DIR" \
