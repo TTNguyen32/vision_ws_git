@@ -368,6 +368,7 @@ git commit -m "Pin optitrack_packages_ros2 submodule to <what changed>"
 - [`docs/livox_mid360_setup.md`](docs/livox_mid360_setup.md) — Livox hardware/driver setup
 - [`docs/dlio_setup.md`](docs/dlio_setup.md) — DLIO setup
 - [`docs/optitrack_setup.md`](docs/optitrack_setup.md) — network/naming, fork+submodule workflow, build dependency ordering, debugging notes
+- [`docs/mesh_and_path_parameters.md`](docs/mesh_and_path_parameters.md) — every `pcd_to_stl.py` / `offset_spline.py` flag, with measured effects
 
 ---
 
