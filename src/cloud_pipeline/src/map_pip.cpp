@@ -56,7 +56,7 @@ Timer t; // declare a timer
 class MapPipeline : public rclcpp::Node
 {
 public:
-    MapPipeline() : Node("cloud_accumulator")
+    MapPipeline() : Node("cloud_pipeline")
     {
         cloud_topic_       = declare_parameter<std::string>("cloud_topic", "/dlio/odom_node/pointcloud/deskewed");
         //cloud_topic_       = declare_parameter<std::string>("cloud_topic", "/livox/lidar");
@@ -179,7 +179,7 @@ public:
             std::bind(&MapPipeline::onCollectionComplete, this));
 
         RCLCPP_INFO(get_logger(),
-            "cloud_accumulator: collecting from '%s' for %.1f seconds...",
+            "cloud_pipeline: collecting from '%s' for %.1f seconds...",
             cloud_topic_.c_str(), collection_duration_sec_);
     }
 

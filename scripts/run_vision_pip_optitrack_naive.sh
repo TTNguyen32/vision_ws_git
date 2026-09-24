@@ -34,7 +34,7 @@
 #        (publish_lidar_tf param, default true) from the
 #        lidar_ext_* extrinsic below -- no separate
 #        static_transform_publisher needed for that link any more.
-#     3. mocap_tf_broadcaster (separate node, cloud_accumulator
+#     3. mocap_tf_broadcaster (separate node, cloud_pipeline
 #        package) independently republishes world -> body as a
 #        DYNAMIC TF, for RViz visualization only.
 #
@@ -79,7 +79,7 @@
 #     offset between the Motive rigid-body origin and the Livox
 #     optical center -- still placeholder zeros.
 #   - mocap_tf_broadcaster registered as an executable in
-#     cloud_accumulator's CMakeLists.txt -- NOT done yet as of this
+#     cloud_pipeline's CMakeLists.txt -- NOT done yet as of this
 #     script (see CMakeLists snippet from earlier in this session).
 #
 # Normal source for path:
@@ -98,10 +98,10 @@ unset LD_LIBRARY_PATH
 ## Kill stale processes
 echo "Checking for stale ROS processes..."
 
-STALE_PIDS=$(pgrep -f '/home/tin/vision_ws/install/cloud_accumulator/lib/cloud_accumulator/map_pip_optitrack' || true)
+STALE_PIDS=$(pgrep -f '/home/tin/vision_ws/install/cloud_pipeline/lib/cloud_pipeline/map_pip_optitrack' || true)
 
 if [ -n "$STALE_PIDS" ]; then
-    echo "Killing stale cloud_accumulator processes: $STALE_PIDS"
+    echo "Killing stale cloud_pipeline processes: $STALE_PIDS"
     kill -9 $STALE_PIDS 2>/dev/null || true
 fi
 
@@ -126,7 +126,7 @@ LOG_DIR="$OUTPUT_DIR/logs"
 MESH_RECONSTRUCT="$HOME/lidar-tools/pcd_to_stl.py"
 SPLINE_SCRIPT="$HOME/lidar-tools/offset_spline.py"
 
-RVIZ_CONFIG="$WORKSPACE/src/cloud_accumulator/src/map_pip_optitrack.rviz"
+RVIZ_CONFIG="$SCRIPT_DIR/../config/map_pip_optitrack.rviz"
 
 LOCKED_TARGET_FILE="$NORMAL_DIR/locked_target.yaml"
 # NOTE: map_pip_optitrack.cpp hardcodes this same path internally
@@ -433,7 +433,7 @@ fi
 
 echo "[2.5/5] Starting mocap_tf_broadcaster (RViz visualization only)..."
 
-ros2 run cloud_accumulator mocap_tf_broadcaster \
+ros2 run cloud_pipeline mocap_tf_broadcaster \
     --ros-args \
     -p mocap_rigid_body:="$MOCAP_RIGID_BODY" \
     -p world_frame:="$MOCAP_WORLD_FRAME" \
@@ -471,7 +471,7 @@ echo "=========================================="
 echo "[4/5] Starting map_pip_optitrack"
 echo "=========================================="
 
-ros2 run cloud_accumulator map_pip_optitrack_slerp \
+ros2 run cloud_pipeline map_pip_optitrack_slerp \
     --ros-args \
     -p save_path:="$MAP_OUTPUT" \
     -p frame_id:="$MOCAP_WORLD_FRAME" \
