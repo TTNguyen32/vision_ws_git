@@ -1,0 +1,323 @@
+#!/bin/bash
+# ============================================================
+# run_vision_pip - A*STAR Drone Vision Pipeline launcher
+#
+# Boot sequence:
+#   Livox Mid-360 -> DLIO -> static TF (lidar -> livox_frame)
+#   -> RViz2 (map_pip.rviz) -> map_pip_mocap_multinormals_test
+#
+# Then opens the rqt control panel (package vision_pip_gui), which
+# does everything the old tmux panes did:
+#
+#   Collection  Start / End
+#   Normals     Undo last / Save / Load locked / Clear all
+#   Path        Generate / Clear
+#   Mesh        (no buttons) live meshes while collecting,
+#               final mesh after End
+#
+# The panel's log lines are shown in this terminal. Everything else
+# (Livox, DLIO, TF, RViz, node) logs to files only.
+#
+# Quit pipeline, or closing the panel window, shuts everything down.
+# Ctrl-C in this terminal does too, without asking.
+#
+# The node creates one folder per run:
+#   ~/vision_ws_outputs/run_<stamp>/{maps,meshes,normals,paths,logs}
+# and points ~/vision_ws_outputs/latest at it.
+# Boot logs (node, DLIO) go to ~/vision_ws_outputs/logs/.
+#
+# Paths live in common.sh; every tunable lives in
+# pipeline_params.yaml (override with PARAMS_FILE=...).
+# ============================================================
+
+set -e
+
+# Prevent Conda libraries from interfering with ROS/CMake/runtime deps
+unset PYTHONPATH
+unset LD_LIBRARY_PATH
+
+# Single source of truth for OUTPUT_DIR, LOCKED_TARGET_FILE,
+# RVIZ_CONFIG, WORKSPACE, ... Also sets SCRIPT_DIR.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+# ============================================================
+# Boot logs
+# ============================================================
+
+BOOT_LOG_DIR="$OUTPUT_DIR/logs"
+mkdir -p "$OUTPUT_DIR" "$BOOT_LOG_DIR"
+
+BOOT_STAMP=$(date +"%Y%m%d_%H%M%S")
+DLIO_LOG="$BOOT_LOG_DIR/dlio_${BOOT_STAMP}.log"
+MAP_LOG="$BOOT_LOG_DIR/node_${BOOT_STAMP}.log"
+GUI_LOG="$BOOT_LOG_DIR/gui_${BOOT_STAMP}.log"
+LIVOX_LOG="$BOOT_LOG_DIR/livox_${BOOT_STAMP}.log"
+TF_LOG="$BOOT_LOG_DIR/tf_${BOOT_STAMP}.log"
+RVIZ_LOG="$BOOT_LOG_DIR/rviz_${BOOT_STAMP}.log"
+for f in "$DLIO_LOG" "$MAP_LOG" "$GUI_LOG" "$LIVOX_LOG" "$TF_LOG" "$RVIZ_LOG"; do
+    : > "$f"
+done
+
+# No run can be collecting before the node starts. A marker left by a
+# crash would make the GUI think one is, so clear any leftovers.
+rm -f "$OUTPUT_DIR"/run_*/.collecting
+
+# ============================================================
+# Parameters: snapshot the YAML for this boot, and derive the
+# node's --params-file from it. PARAMS_FILE is exported so the
+# control panel reads the same snapshot, not the editable original.
+# ============================================================
+
+PARAMS_SNAPSHOT="$BOOT_LOG_DIR/params_${BOOT_STAMP}.yaml"
+NODE_PARAMS="$BOOT_LOG_DIR/node_params_${BOOT_STAMP}.yaml"
+
+cp "$PARAMS_FILE" "$PARAMS_SNAPSHOT"
+"${PARAMS_PY[@]}" "$PARAMS_LOADER" node "$PARAMS_SNAPSHOT" "$NODE_PARAMS"
+export PARAMS_FILE="$PARAMS_SNAPSHOT"
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+cleanup() {
+    # Disable the traps immediately so cleanup cannot run twice.
+    trap - EXIT INT TERM
+
+    echo ""
+    echo "=========================================="
+    echo "Cleaning up"
+    echo "=========================================="
+
+    for pid_var in GUI_PID MAP_PID DLIO_PID TF_PID RVIZ_PID LIVOX_PID; do
+        pid="${!pid_var:-}"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping $pid_var ($pid)..."
+            pkill -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Don't wait indefinitely for ROS to shut down.
+    sleep 1
+
+    # Force any remaining processes to exit.
+    for pid_var in GUI_PID MAP_PID DLIO_PID TF_PID RVIZ_PID LIVOX_PID; do
+        pid="${!pid_var:-}"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Force stopping $pid_var ($pid)..."
+            pkill -9 -P "$pid" 2>/dev/null || true
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Mesh/spline jobs belong to the GUI; normally it stops them, but
+    # not if it was killed. They are matched by script path.
+    pkill -f "$MESH_RECONSTRUCT" 2>/dev/null || true
+    pkill -f "$SPLINE_SCRIPT" 2>/dev/null || true
+
+    rm -f "$OUTPUT_DIR"/run_*/.collecting
+
+    echo "Cleanup complete."
+}
+
+trap cleanup EXIT INT TERM
+
+# ============================================================
+# Source workspaces
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "Initialising ROS 2 environment"
+echo "=========================================="
+
+source /opt/ros/humble/setup.bash
+
+if [[ -f "$HOME/livox_ws/install/setup.bash" ]]; then
+    source "$HOME/livox_ws/install/setup.bash"
+else
+    echo "WARNING: Livox workspace not found: $HOME/livox_ws/install/setup.bash"
+fi
+
+if [[ -f "$HOME/dlio_ws/install/setup.bash" ]]; then
+    source "$HOME/dlio_ws/install/setup.bash"
+else
+    echo "WARNING: DLIO workspace not found: $HOME/dlio_ws/install/setup.bash"
+fi
+
+if [[ -f "$WORKSPACE/install/setup.bash" ]]; then
+    source "$WORKSPACE/install/setup.bash"
+else
+    echo "ERROR: Vision workspace not built: $WORKSPACE/install/setup.bash"
+    exit 1
+fi
+
+# ============================================================
+# Display configuration
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "A*STAR Drone Vision Pipeline"
+echo "=========================================="
+echo "Scripts:         $SCRIPT_DIR"
+echo "Parameters:      $PARAMS_FILE"
+echo "Output root:     $OUTPUT_DIR"
+echo "Locked target:   $LOCKED_TARGET_FILE"
+echo "RViz config:     $RVIZ_CONFIG"
+echo "Node log:        $MAP_LOG"
+echo "DLIO log:        $DLIO_LOG"
+echo "GUI log:         $GUI_LOG"
+echo "Other logs:      $BOOT_LOG_DIR/{livox,tf,rviz}_${BOOT_STAMP}.log"
+
+# ============================================================
+# Confirm the LiDAR is powered before starting drivers
+# ============================================================
+
+while true; do
+    echo ""
+    read -r -p "Is Livox turned on? [y/N]: " LIDAR_REPLY
+    [[ "$LIDAR_REPLY" =~ ^[Yy]$ ]] && break
+done
+
+# ============================================================
+# 1. Livox Mid-360
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[1/6] Starting Livox Mid-360 driver..."
+echo "=========================================="
+
+ros2 launch livox_ros_driver2 msg_MID360_launch.py > "$LIVOX_LOG" 2>&1 &
+LIVOX_PID=$!
+
+sleep 3
+
+TOPIC_TYPE=$(ros2 topic type /livox/lidar 2>/dev/null || echo "unknown")
+if [[ "$TOPIC_TYPE" != *"PointCloud2"* ]]; then
+    echo "WARNING: /livox/lidar reports '$TOPIC_TYPE', expected sensor_msgs/PointCloud2."
+    echo "Check xfer_format = 0 in msg_MID360_launch.py"
+else
+    echo "Confirmed: /livox/lidar -> PointCloud2"
+fi
+
+# ============================================================
+# 2. DLIO (rviz:=false -- we launch our own RViz below)
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[2/6] Starting DLIO..."
+echo "=========================================="
+
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+    rviz:=false \
+    pointcloud_topic:=/livox/lidar \
+    imu_topic:=/livox/imu \
+    > "$DLIO_LOG" 2>&1 &
+DLIO_PID=$!
+echo "DLIO PID: $DLIO_PID"
+
+# ============================================================
+# 3. Static TF: lidar -> livox_frame
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[3/6] Starting static TF (lidar -> livox_frame)..."
+echo "=========================================="
+
+ros2 run tf2_ros static_transform_publisher \
+    0 0 0 0 0 0 lidar livox_frame > "$TF_LOG" 2>&1 &
+TF_PID=$!
+
+sleep 3
+
+# ============================================================
+# 4. RViz2 with the project config
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[4/6] Starting RViz2..."
+echo "=========================================="
+
+if [[ -f "$RVIZ_CONFIG" ]]; then
+    ros2 run rviz2 rviz2 -d "$RVIZ_CONFIG" > "$RVIZ_LOG" 2>&1 &
+else
+    echo "WARNING: RViz config not found: $RVIZ_CONFIG"
+    echo "Launching RViz2 with default configuration."
+    ros2 run rviz2 rviz2 > "$RVIZ_LOG" 2>&1 &
+fi
+RVIZ_PID=$!
+
+# ============================================================
+# 5. Map pipeline node
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[5/6] Starting map_pip_mocap_multinormals_test..."
+echo "=========================================="
+
+ros2 run cloud_accumulator map_pip_dlio_multinormals_test \
+    --ros-args \
+    --params-file "$NODE_PARAMS" \
+    -p output_dir:="$OUTPUT_DIR" \
+    -p locked_target_path:="$LOCKED_TARGET_FILE" \
+    > >(tee -a "$MAP_LOG") 2>&1 &
+MAP_PID=$!
+echo "Node PID: $MAP_PID"
+
+sleep 2
+if ! kill -0 "$MAP_PID" 2>/dev/null; then
+    echo "ERROR: node exited during startup. Last lines of $MAP_LOG:"
+    tail -n 20 "$MAP_LOG"
+    exit 1
+fi
+
+# ============================================================
+# 6. Control panel
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[6/6] Opening control panel..."
+echo "=========================================="
+
+# common.sh values are shell variables, not exported, so the ones the
+# GUI needs are passed here. PARAMS_FILE is already exported.
+# --force-discover makes rqt re-read plugin.xml, so a rebuilt plugin
+# is always picked up.
+# Output goes to this terminal and to GUI_LOG. $! is rqt itself, not
+# tee, because tee runs in a process substitution.
+OUTPUT_DIR="$OUTPUT_DIR" \
+LOCKED_TARGET_FILE="$LOCKED_TARGET_FILE" \
+MESH_RECONSTRUCT="$MESH_RECONSTRUCT" \
+SPLINE_SCRIPT="$SPLINE_SCRIPT" \
+CONDA_ENV="$CONDA_ENV" \
+PARAMS_LOADER="$PARAMS_LOADER" \
+    rqt --force-discover --standalone vision_pip_gui/PipelinePanel \
+    > >(tee -a "$GUI_LOG") 2>&1 &
+GUI_PID=$! # PID: process ID - the number the OS kernel assigns to every running process. 
+
+## invokes rqt
+echo "GUI PID: $GUI_PID"
+
+sleep 2
+# Health check: asks kernel if process with this PID exists. detects rqt crash
+if ! kill -0 "$GUI_PID" 2>/dev/null; then
+    echo "ERROR: rqt exited during startup (see output above and $GUI_LOG)"
+    exit 1
+fi
+
+echo ""
+echo "Pipeline running. Quit from the panel, or Ctrl-C here."
+echo "------------------------------------------"
+
+# Block until the panel closes; the EXIT trap then runs cleanup().
+GUI_STATUS=0
+wait "$GUI_PID" || GUI_STATUS=$?
+echo "------------------------------------------"
+echo "Control panel closed (exit $GUI_STATUS)."

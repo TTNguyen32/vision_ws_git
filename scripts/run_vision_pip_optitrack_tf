@@ -1,0 +1,431 @@
+#!/bin/bash
+# ============================================================
+# run_vision_pip_tf - A*STAR Drone Vision Pipeline launcher
+#                     (drone-mounted LiDAR, TF-only pose path)
+#
+#   Livox Mid-360 -> OptiTrack (wrapper + multiplexer)
+#   -> mocap_tf_broadcaster (world -> base, dynamic)
+#   -> static TF (base -> livox_frame, the extrinsic)
+#   -> RViz2 -> map_pip_tf -> rqt control panel
+#
+# Pose path: TF, end to end. The broadcaster publishes the moving
+# world -> base edge, static_transform_publisher publishes the fixed
+# base -> livox_frame extrinsic, and map_pip_tf asks tf2 for
+# world -> livox_frame AT EACH SCAN'S OWN STAMP. tf2 interpolates the
+# dynamic edge to that stamp, so the node needs no pose buffer of its
+# own. mocap_tf_broadcaster is now load-bearing: without it there is
+# no world -> base edge and every scan is dropped.
+#
+# /start_collection is refused until world -> livox_frame resolves
+# (wait_for_tf), so pressing Start too early is harmless.
+#
+# Must live next to common.sh. Paths live in common.sh; every
+# pipeline tunable lives in pipeline_params.yaml. Mocap and extrinsic
+# settings are below.
+# ============================================================
+
+set -e
+
+# Prevent Conda libraries from interfering with ROS/CMake/runtime deps
+unset PYTHONPATH
+unset LD_LIBRARY_PATH
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+# common.sh points RVIZ_CONFIG at the DLIO config (fixed frame odom).
+# This map also lives in "world", so reuse the OptiTrack config.
+RVIZ_CONFIG="${OPTITRACK_RVIZ_CONFIG:-$WORKSPACE/src/cloud_accumulator/src/map_pip_optitrack.rviz}"
+
+# ============================================================
+# OptiTrack and extrinsic configuration
+# ============================================================
+
+# Workspace where lis-epfl/optitrack_packages_ros2 is built.
+OPTITRACK_WS="$HOME/ros2_ws"
+
+# Rigid body name EXACTLY as Motive reports it (confirmed via
+# get_data_descriptions).
+MOCAP_RIGID_BODY="Tin_LIDAR"
+MOCAP_POSE_TOPIC="/optitrack_multiplexer_node/rigid_body/${MOCAP_RIGID_BODY}"
+
+# TF frames.
+#   WORLD_FRAME -> BODY_FRAME   dynamic, from mocap_tf_broadcaster
+#   BODY_FRAME  -> LIDAR_FRAME  static, published below
+# BODY_FRAME must match the broadcaster's child frame exactly, and
+# LIDAR_FRAME must match the frame_id Livox stamps on its clouds.
+WORLD_FRAME="world"
+BODY_FRAME="$MOCAP_RIGID_BODY"
+LIDAR_FRAME="livox_frame"
+
+# Rigid-body origin -> Livox optical centre (m, rad;
+# R = Rz(yaw) * Ry(pitch) * Rx(roll)).
+# TODO: replace with the CAD/measured offset.
+LIDAR_EXT_X=0.0
+LIDAR_EXT_Y=0.0
+LIDAR_EXT_Z=0.0
+LIDAR_EXT_ROLL=0.0
+LIDAR_EXT_PITCH=0.0
+LIDAR_EXT_YAW=0.0
+
+# ============================================================
+# Boot logs
+# ============================================================
+
+BOOT_LOG_DIR="$OUTPUT_DIR/logs"
+mkdir -p "$OUTPUT_DIR" "$BOOT_LOG_DIR"
+
+BOOT_STAMP=$(date +"%Y%m%d_%H%M%S")
+MOCAP_LOG="$BOOT_LOG_DIR/optitrack_${BOOT_STAMP}.log"
+MOCAP_TF_LOG="$BOOT_LOG_DIR/mocap_tf_${BOOT_STAMP}.log"
+MAP_LOG="$BOOT_LOG_DIR/node_${BOOT_STAMP}.log"
+GUI_LOG="$BOOT_LOG_DIR/gui_${BOOT_STAMP}.log"
+LIVOX_LOG="$BOOT_LOG_DIR/livox_${BOOT_STAMP}.log"
+TF_LOG="$BOOT_LOG_DIR/tf_${BOOT_STAMP}.log"
+RVIZ_LOG="$BOOT_LOG_DIR/rviz_${BOOT_STAMP}.log"
+for f in "$MOCAP_LOG" "$MOCAP_TF_LOG" "$MAP_LOG" "$GUI_LOG" "$LIVOX_LOG" "$TF_LOG" "$RVIZ_LOG"; do
+    : > "$f"
+done
+
+# No run can be collecting before the node starts. A marker left by a
+# crash would make the GUI think one is, so clear any leftovers.
+rm -f "$OUTPUT_DIR"/run_*/.collecting
+
+# ============================================================
+# Parameters: snapshot the YAML for this boot, and derive the
+# node's --params-file from it. PARAMS_FILE is exported so the
+# control panel reads the same snapshot, not the editable original.
+# ============================================================
+
+PARAMS_SNAPSHOT="$BOOT_LOG_DIR/params_${BOOT_STAMP}.yaml"
+NODE_PARAMS="$BOOT_LOG_DIR/node_params_${BOOT_STAMP}.yaml"
+
+cp "$PARAMS_FILE" "$PARAMS_SNAPSHOT"
+"${PARAMS_PY[@]}" "$PARAMS_LOADER" node "$PARAMS_SNAPSHOT" "$NODE_PARAMS"
+export PARAMS_FILE="$PARAMS_SNAPSHOT"
+
+# A ROS 2 params file only applies to the node named by its top-level
+# key. This node is "map_pip_tf", not "cloud_accumulator", so a
+# file keyed to the old name would be silently ignored and every
+# pipeline tunable would fall back to its C++ default.
+NODE_KEY=$(grep -m1 -E '^[^[:space:]#][^:]*:' "$NODE_PARAMS" | cut -d: -f1 || true)
+if [[ "$NODE_KEY" != "/**" && "$NODE_KEY" != "map_pip_tf" ]]; then
+    echo "ERROR: $NODE_PARAMS is keyed to '$NODE_KEY'."
+    echo "map_pip_tf would ignore it. Make the params loader emit"
+    echo "'/**:' (any node) or 'map_pip_tf:' as the top-level key."
+    exit 1
+fi
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+PID_VARS=(GUI_PID MAP_PID RVIZ_PID TF_PID MOCAP_TF_PID MOCAP_PID LIVOX_PID)
+
+cleanup() {
+    # Disable the traps immediately so cleanup cannot run twice.
+    trap - EXIT INT TERM
+
+    echo ""
+    echo "=========================================="
+    echo "Cleaning up"
+    echo "=========================================="
+
+    for pid_var in "${PID_VARS[@]}"; do
+        pid="${!pid_var:-}"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping $pid_var ($pid)..."
+            pkill -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Don't wait indefinitely for ROS to shut down.
+    sleep 1
+
+    # Force any remaining processes to exit.
+    for pid_var in "${PID_VARS[@]}"; do
+        pid="${!pid_var:-}"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Force stopping $pid_var ($pid)..."
+            pkill -9 -P "$pid" 2>/dev/null || true
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Mesh/spline jobs belong to the GUI; normally it stops them, but
+    # not if it was killed. They are matched by script path.
+    pkill -f "$MESH_RECONSTRUCT" 2>/dev/null || true
+    pkill -f "$SPLINE_SCRIPT" 2>/dev/null || true
+
+    rm -f "$OUTPUT_DIR"/run_*/.collecting
+
+    echo "Cleanup complete."
+}
+
+trap cleanup EXIT INT TERM
+
+# ============================================================
+# Source workspaces
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "Initialising ROS 2 environment"
+echo "=========================================="
+
+source /opt/ros/humble/setup.bash
+
+if [[ -f "$HOME/livox_ws/install/setup.bash" ]]; then
+    source "$HOME/livox_ws/install/setup.bash"
+else
+    echo "WARNING: Livox workspace not found: $HOME/livox_ws/install/setup.bash"
+fi
+
+# optitrack_packages_ros2 is built from source; mocap_tf_broadcaster also
+# needs its message package, so this one is fatal.
+if [[ -f "$OPTITRACK_WS/install/setup.bash" ]]; then
+    source "$OPTITRACK_WS/install/setup.bash"
+else
+    echo "ERROR: OptiTrack workspace not found: $OPTITRACK_WS/install/setup.bash"
+    exit 1
+fi
+
+if [[ -f "$WORKSPACE/install/setup.bash" ]]; then
+    source "$WORKSPACE/install/setup.bash"
+else
+    echo "ERROR: Vision workspace not built: $WORKSPACE/install/setup.bash"
+    exit 1
+fi
+
+# ============================================================
+# Display configuration
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "A*STAR Drone Vision Pipeline (TF pose path)"
+echo "=========================================="
+echo "Scripts:         $SCRIPT_DIR"
+echo "Parameters:      $PARAMS_FILE"
+echo "Output root:     $OUTPUT_DIR"
+echo "Locked target:   $LOCKED_TARGET_FILE"
+echo "RViz config:     $RVIZ_CONFIG"
+echo "Rigid body:      $MOCAP_RIGID_BODY  ($MOCAP_POSE_TOPIC)"
+echo "TF chain:        $WORLD_FRAME -> $BODY_FRAME -> $LIDAR_FRAME"
+echo "Extrinsic:       xyz=($LIDAR_EXT_X, $LIDAR_EXT_Y, $LIDAR_EXT_Z)" \
+     "rpy=($LIDAR_EXT_ROLL, $LIDAR_EXT_PITCH, $LIDAR_EXT_YAW)"
+echo "Node log:        $MAP_LOG"
+echo "OptiTrack log:   $MOCAP_LOG"
+echo "GUI log:         $GUI_LOG"
+echo "Other logs:      $BOOT_LOG_DIR/{livox,mocap_tf,tf,rviz}_${BOOT_STAMP}.log"
+
+# ============================================================
+# Confirm hardware before starting drivers
+# ============================================================
+
+while true; do
+    echo ""
+    read -r -p "Is Livox turned on? [y/N]: " LIDAR_REPLY
+    [[ "$LIDAR_REPLY" =~ ^[Yy]$ ]] && break
+done
+
+while true; do
+    read -r -p "Is Motive streaming (and $MOCAP_RIGID_BODY tracked)? [y/N]: " MOCAP_REPLY
+    [[ "$MOCAP_REPLY" =~ ^[Yy]$ ]] && break
+done
+
+# ============================================================
+# 1. Livox Mid-360
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[1/6] Starting Livox Mid-360 driver..."
+echo "=========================================="
+
+ros2 launch livox_ros_driver2 msg_MID360_launch.py > "$LIVOX_LOG" 2>&1 &
+LIVOX_PID=$!
+
+sleep 3
+
+TOPIC_TYPE=$(ros2 topic type /livox/lidar 2>/dev/null || echo "unknown")
+if [[ "$TOPIC_TYPE" != *"PointCloud2"* ]]; then
+    echo "WARNING: /livox/lidar reports '$TOPIC_TYPE', expected sensor_msgs/PointCloud2."
+    echo "Check xfer_format = 0 in msg_MID360_launch.py"
+else
+    echo "Confirmed: /livox/lidar -> PointCloud2"
+fi
+
+# ============================================================
+# 2. OptiTrack (wrapper + multiplexer) + mocap_tf_broadcaster
+#    The broadcaster owns the dynamic world -> base TF edge, so it is
+#    now part of the pose path, not a visualisation extra.
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[2/6] Starting OptiTrack (wrapper + multiplexer)..."
+echo "=========================================="
+
+ros2 launch optitrack_multiplexer_ros2 wrapper_and_multiplexer.launch.py \
+    > "$MOCAP_LOG" 2>&1 &
+MOCAP_PID=$!
+echo "OptiTrack PID: $MOCAP_PID"
+
+sleep 3
+
+# Wait for an actual message, not just an advertised topic: a
+# rigid_body_names mismatch gives a live publisher with zero messages.
+if timeout 5 ros2 topic echo --once "$MOCAP_POSE_TOPIC" > /dev/null 2>&1; then
+    echo "Confirmed: $MOCAP_POSE_TOPIC is publishing"
+else
+    echo "WARNING: no message on $MOCAP_POSE_TOPIC within 5 s."
+    echo "  - Is $MOCAP_RIGID_BODY tracked in Motive?"
+    echo "  - Does rigid_body_names match Motive exactly? Check with"
+    echo "      ros2 service call /optitrack_wrapper_node/get_data_descriptions \\"
+    echo "        optitrack_wrapper_ros2_msgs/srv/GetDataDescriptions \"{}\""
+    echo "  - Rebuilt optitrack_packages_ros2 after editing its config?"
+fi
+
+# Fatal now: without world -> $BODY_FRAME there is no pose path at all.
+if ! ros2 pkg executables cloud_accumulator 2>/dev/null | grep -qw mocap_tf_broadcaster; then
+    echo "ERROR: mocap_tf_broadcaster is not built, so nothing publishes"
+    echo "       $WORLD_FRAME -> $BODY_FRAME and every scan would be dropped."
+    echo "       Add it to cloud_accumulator's CMakeLists.txt and rebuild."
+    exit 1
+fi
+
+ros2 run cloud_accumulator mocap_tf_broadcaster \
+    --ros-args \
+    -p mocap_rigid_body:="$MOCAP_RIGID_BODY" \
+    -p world_frame:="$WORLD_FRAME" \
+    > "$MOCAP_TF_LOG" 2>&1 &
+MOCAP_TF_PID=$!
+echo "mocap_tf_broadcaster PID: $MOCAP_TF_PID"
+
+sleep 1
+
+# ============================================================
+# 3. Static TF: base -> livox_frame (the LiDAR extrinsic)
+#    Published once on /tf_static (latched), so nodes that start
+#    later still receive it. This is the ONLY hand-set transform.
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[3/6] Starting static TF ($BODY_FRAME -> $LIDAR_FRAME)..."
+echo "=========================================="
+
+ros2 run tf2_ros static_transform_publisher \
+    --x "$LIDAR_EXT_X" --y "$LIDAR_EXT_Y" --z "$LIDAR_EXT_Z" \
+    --roll "$LIDAR_EXT_ROLL" --pitch "$LIDAR_EXT_PITCH" --yaw "$LIDAR_EXT_YAW" \
+    --frame-id "$BODY_FRAME" --child-frame-id "$LIDAR_FRAME" \
+    > "$TF_LOG" 2>&1 &
+TF_PID=$!
+
+sleep 1
+if ! kill -0 "$TF_PID" 2>/dev/null; then
+    echo "ERROR: static_transform_publisher exited. Last lines of $TF_LOG:"
+    tail -n 20 "$TF_LOG"
+    exit 1
+fi
+
+# Check the whole chain resolves, not just that the processes live.
+if timeout 5 ros2 run tf2_ros tf2_echo "$WORLD_FRAME" "$LIDAR_FRAME" > /dev/null 2>&1; then
+    echo "Confirmed: $WORLD_FRAME -> $LIDAR_FRAME resolves"
+else
+    echo "WARNING: $WORLD_FRAME -> $LIDAR_FRAME did not resolve within 5 s."
+    echo "  Check the broadcaster's child frame really is '$BODY_FRAME':"
+    echo "      ros2 run tf2_tools view_frames"
+    echo "  Continuing: the node will refuse /start_collection until it does."
+fi
+
+# ============================================================
+# 4. RViz2
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[4/6] Starting RViz2..."
+echo "=========================================="
+
+if [[ -f "$RVIZ_CONFIG" ]]; then
+    ros2 run rviz2 rviz2 -d "$RVIZ_CONFIG" > "$RVIZ_LOG" 2>&1 &
+else
+    echo "WARNING: RViz config not found: $RVIZ_CONFIG"
+    echo "Launching RViz2 with default configuration."
+    ros2 run rviz2 rviz2 > "$RVIZ_LOG" 2>&1 &
+fi
+RVIZ_PID=$!
+
+# ============================================================
+# 5. Map pipeline node
+#    -p after --params-file wins, so the frame overrides below beat any
+#    DLIO-era frame_id: odom still sitting in pipeline_params.yaml.
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[5/6] Starting map_pip_tf..."
+echo "=========================================="
+
+ros2 run cloud_accumulator map_pip_optitrack_tf \
+    --ros-args \
+    --params-file "$NODE_PARAMS" \
+    -p output_dir:="$OUTPUT_DIR" \
+    -p locked_target_path:="$LOCKED_TARGET_FILE" \
+    -p frame_id:="$WORLD_FRAME" \
+    -p body_frame:="$BODY_FRAME" \
+    -p lidar_frame:="$LIDAR_FRAME" \
+    > "$MAP_LOG" 2>&1 &
+MAP_PID=$!
+echo "Node PID: $MAP_PID"
+
+sleep 2
+if ! kill -0 "$MAP_PID" 2>/dev/null; then
+    echo "ERROR: node exited during startup. Last lines of $MAP_LOG:"
+    tail -n 20 "$MAP_LOG"
+    exit 1
+fi
+
+# ============================================================
+# 6. Control panel
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "[6/6] Opening control panel..."
+echo "=========================================="
+
+# common.sh values are shell variables, not exported, so the ones the
+# GUI needs are passed here. PARAMS_FILE is already exported.
+# --force-discover makes rqt re-read plugin.xml, so a rebuilt plugin
+# is always picked up.
+# Output goes to this terminal and to GUI_LOG. $! is rqt itself, not
+# tee, because tee runs in a process substitution.
+OUTPUT_DIR="$OUTPUT_DIR" \
+LOCKED_TARGET_FILE="$LOCKED_TARGET_FILE" \
+MESH_RECONSTRUCT="$MESH_RECONSTRUCT" \
+SPLINE_SCRIPT="$SPLINE_SCRIPT" \
+CONDA_ENV="$CONDA_ENV" \
+PARAMS_LOADER="$PARAMS_LOADER" \
+    rqt --force-discover --standalone vision_pip_gui/PipelinePanel \
+    > >(tee -a "$GUI_LOG") 2>&1 &
+GUI_PID=$!
+echo "GUI PID: $GUI_PID"
+
+sleep 2
+if ! kill -0 "$GUI_PID" 2>/dev/null; then
+    echo "ERROR: rqt exited during startup (see output above and $GUI_LOG)"
+    exit 1
+fi
+
+echo ""
+echo "Pipeline running. Quit from the panel, or Ctrl-C here."
+echo "------------------------------------------"
+
+# Block until the panel closes; the EXIT trap then runs cleanup().
+GUI_STATUS=0
+wait "$GUI_PID" || GUI_STATUS=$?
+echo "------------------------------------------"
+echo "Control panel closed (exit $GUI_STATUS)."

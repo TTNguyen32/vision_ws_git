@@ -1,0 +1,125 @@
+# ============================================================
+# pipeline_params.yaml - every tunable of the vision pipeline
+#
+# Edit this file, then relaunch run_vision_pip. Values are read
+# once at launch; editing mid-session has no effect until the
+# next launch.
+#
+# The launcher snapshots this file into
+#   ~/vision_ws_outputs/logs/params_<boot stamp>.yaml
+# and each run gets a copy at
+#   ~/vision_ws_outputs/run_<stamp>/params.yaml
+# so every result records the settings that produced it.
+#
+# To try an alternative without editing this one:
+#   PARAMS_FILE=~/experiments/deep_mesh.yaml ./run_vision_pip
+#
+# Paths (output folder, locked target, tool scripts) are not
+# tuning parameters and stay in common.sh.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# node: ROS parameters for map_pip_mocap_multinormals_test
+#
+# TYPES MATTER. A parameter the node declares as double must be
+# written with a decimal point (0.0, not 0), and an int without
+# one. A mismatch makes the node exit at startup; the launcher
+# then prints the error from the node log.
+# ------------------------------------------------------------
+node:
+  # ---- collection ----
+  snapshot_period_sec: 2.5      # live snapshot interval (s); also sets the live mesh cadence
+  voxel_leaf_size: 0.007        # voxel filter size (m)
+  duplicate_distance: 0.005     # new points closer than this to the map are dropped (m)
+  tf_lookup_timeout_sec: 0.1
+
+  # ---- bounding box, in frame_id (m) ----
+  min_x: 0.0
+  max_x: 0.5
+  min_y: -0.2
+  max_y: 0.2
+  min_z: 0.0
+  max_z: 0.2
+
+  # ---- final cloud cleanup (statistical outlier removal) ----
+  sor_mean_k: 50                # int. Keep small: k=2000 froze the node
+  sor_stddev_mult: 10.0
+
+  # ---- cylinder fit (RANSAC) ----
+  max_ransac_iterations: 1000   # int. Main cost of live cylinder fits
+  ransac_probability: 0.95
+  min_radius: 0.005             # expected trunk radius range (m)
+  max_radius: 0.15
+
+  # ---- normal selection / path ----
+  normal_merge_radius: 0.01     # clicking within this of a normal removes it (m)
+  generate_path: true
+
+  # ---- frames ----
+  frame_id: odom
+  world_frame: odom
+  lidar_frame: lidar
+
+  # ---- topics ----
+  cloud_topic: /livox/lidar
+  clicked_topic: /clicked_point
+  global_map_topic: /global_map
+  processed_topic: /processed/map
+  targets_topic: /processed/selected_normals
+  targets_markers_topic: selected_normals_markers
+  path_topic: /processed/path
+  cylinder_rim: /processed/cylinder_rim
+  cylinder_axis: /processed/cylinder_axis
+  mesh_topic: /processed/mesh
+
+
+# ------------------------------------------------------------
+# mesh: arguments for pcd_to_stl.py
+#
+# Each key is a pcd_to_stl.py flag without the leading dashes
+# (underscores become dashes). Any flag from
+#   python pcd_to_stl.py --help
+# can be added here without touching the shell scripts.
+#   true         -> flag is passed        (keep_largest: true)
+#   false / null -> flag is left out
+#   list         -> flag followed by each value (axis_dir: [0, 0, 1])
+# ------------------------------------------------------------
+mesh:
+  # Runs on every snapshot while collecting; must finish within
+  # snapshot_period_sec or the live mesh falls behind.
+  live:
+    method: poisson
+    poisson_depth: 7
+    orient: radial              # outward from fitted trunk axis (multi-view safe)
+    axis_dir: null              # e.g. [0, 0, 1] if the fitted axis tilts
+    density_quantile: 0.1
+    keep_largest: true
+    crop_to_input: true
+
+  # Runs once after 'e'; quality over speed.
+  final:
+    method: poisson
+    poisson_depth: 9
+    orient: radial
+    axis_dir: null
+    density_quantile: 0.10
+    keep_largest: true
+    crop_to_input: true
+
+
+# ------------------------------------------------------------
+# path: arguments for offset_spline.py
+#
+# Same key rules as mesh. The normals file, mesh, -o and --csv
+# are supplied by path.sh and must not be set here.
+# ------------------------------------------------------------
+path:
+  offset: 0.05                  # standoff from the surface (m)
+  spacing: 0.01                 # waypoint spacing (m)
+  iterations: 60
+  smooth_start: 0.6
+  smooth_end: 0.02
+  order: file                   # visit normals in selection order
+  side: outward
+  project_knots: true
