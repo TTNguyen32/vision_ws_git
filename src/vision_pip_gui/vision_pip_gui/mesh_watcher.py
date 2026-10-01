@@ -6,6 +6,12 @@
 One mesh at a time. While a live mesh runs, new snapshots are not
 queued: the next mesh always uses the newest snapshot, so a slow mesh
 skips snapshots instead of falling further behind.
+
+remesh() is the one entry point from outside the timer. It exists for
+cluster removal: the node rewrites the cloud on disk, but nothing in
+the loop above would notice, because the state machine reacts to the
+marker and to NEW snapshot files, not to a file being rewritten in
+place.
 """
 import glob
 import os
@@ -35,7 +41,7 @@ class MeshWatcher(QObject):
         self._wait_t0 = 0.0
         self._job = None           # (label, src, out)
 
-        self._tool = ToolRun(self)
+        self._tool = ToolRun('mesh', self)
         self._tool.done.connect(self._on_done)
 
         self._timer = QTimer(self)
@@ -45,6 +51,56 @@ class MeshWatcher(QObject):
 
     def busy(self):
         return self._tool.running()
+
+    def remesh(self, run=None):
+        """Rebuild `run`'s mesh from the cloud currently on disk.
+
+        Returns (handled, message). handled is True when a rebuild is
+        running or is certain to happen on its own; the caller logs the
+        message either way.
+        """
+        run = run or common.current_run()
+        if run is None:
+            return False, 'no run yet'
+
+        # While collecting there is nothing to force: the node writes a
+        # fresh snapshot as soon as it removes a cluster, and the LIVE
+        # branch of _tick() picks up the newest snapshot by itself.
+        if common.is_collecting(run):
+            return True, 'live meshing will rebuild from the new snapshot'
+
+        # Collection has just ended and the automatic final mesh is
+        # already queued behind FINAL_WAIT. Forcing one here would race it.
+        if self._state in (LIVE, FINAL_WAIT):
+            return True, 'the final mesh is already on its way'
+
+        if self._tool.running():
+            label = self._job[0] if self._job else 'a'
+            return False, f'{label} mesh is still running - try again when it ends'
+
+        ts = common.run_stamp(run)
+        pcd = os.path.join(run, 'maps', f'global_map_{ts}.pcd')
+        if not os.path.isfile(pcd):
+            return False, f'no final cloud on disk: {os.path.basename(pcd)}'
+
+        # _go_idle() cleared _run when the last final mesh finished, and
+        # _start() needs it for the log path, so restore it first.
+        self._run = run
+        self._state = FINAL
+        out = os.path.join(run, 'meshes', f'map_{ts}.stl')
+        self.log.emit(f'mesh: rebuilding from {os.path.basename(pcd)}')
+        self._start('FINAL', pcd, out, self._final_args)
+
+        # _start() calls _go_idle() on failure, so the state is the
+        # honest answer to "did it actually start?".
+        if self._state != FINAL:
+            return False, 'could not start - see mesh.log'
+        return True, f'rebuilding {os.path.basename(out)}' 
+
+    def set_args(self, live_args, final_args):
+        """Used from the next mesh on; a running one keeps its flags."""
+        self._live_args = list(live_args)
+        self._final_args = list(final_args)
 
     def stop(self):
         self._timer.stop()

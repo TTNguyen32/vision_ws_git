@@ -27,6 +27,10 @@ CONDA_ENV = os.environ.get('CONDA_ENV', 'lidar')
 
 PARAMS_LOADER = os.environ.get('PARAMS_LOADER', '')
 
+# 1 = also print mesh/spline tool output to stdout (the launcher's
+# terminal), 0 = log files only. Set by run_vision_pip.
+ECHO_TOOL_LOGS = os.environ.get('ECHO_TOOL_LOGS', '1') == '1'
+
 # Present in a run folder == collection in progress.
 MARKER = '.collecting'
 
@@ -117,13 +121,14 @@ def copy_params(run):
     return dst
 
 
-def load_tool_args():
+def load_tool_args(params=None):
     """Run load_params.py exactly as common.sh does and return its arrays.
 
     {'MESH_LIVE_ARGS': [...], 'MESH_FINAL_ARGS': [...], 'SPLINE_ARGS': [...]}
     Raises RuntimeError with a readable reason.
     """
-    params = params_file()
+    if params is None:
+        params = params_file()
     if params is None:
         raise RuntimeError('PARAMS_FILE is not set or does not exist')
     if not PARAMS_LOADER or not os.path.isfile(PARAMS_LOADER):
@@ -147,5 +152,57 @@ def load_tool_args():
     return arrays
 
 
+def tool_args_for(data):
+    """Tool flags for an in-memory params dict.
+
+    Goes through load_params.py like everything else, so a bad edit is
+    rejected by the same validation that guards the launch.
+    """
+    import tempfile
+    import yaml
+    fd, tmp = tempfile.mkstemp(suffix='.yaml', prefix='params_')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+        return load_tool_args(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def conda_exe():
     return os.environ.get('CONDA_EXE') or shutil.which('conda')
+
+
+_conda_prefix = None
+
+
+def conda_run_prefix():
+    """['conda', 'run', ('--no-capture-output',) '-n', ENV], or None.
+
+    Without --no-capture-output, 'conda run' holds a tool's output back
+    until it exits. The flag exists from conda 4.9; older versions still
+    work, the output just arrives in one piece at the end.
+    """
+    global _conda_prefix
+    if _conda_prefix is None:
+        conda = conda_exe()
+        if not conda:
+            return None
+        try:
+            res = subprocess.run([conda, 'run', '--help'],
+                                 capture_output=True, text=True, timeout=60)
+            live = '--no-capture-output' in res.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            live = False
+        _conda_prefix = ([conda, 'run']
+                         + (['--no-capture-output'] if live else [])
+                         + ['-n', CONDA_ENV])
+    return _conda_prefix
+
+
+def conda_streams_live():
+    prefix = conda_run_prefix()
+    return prefix is not None and '--no-capture-output' in prefix

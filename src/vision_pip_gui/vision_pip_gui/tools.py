@@ -2,7 +2,9 @@
 
 The QProcess form of mesh_one() in mesh.sh and the spline call in
 path.sh:
-  - output is appended to a log file, never to the GUI;
+  - output is appended to a log file and, if ECHO_TOOL_LOGS is on,
+    printed to stdout with a [tag] prefix (the launcher shows stdout
+    in its terminal); it never goes to the panel's own log view;
   - the tool writes a dot-prefixed temp file that is renamed on
     success, so the node never opens a partial file;
   - the tool runs under 'setsid' in its own process group, so kill()
@@ -13,7 +15,8 @@ import shlex
 import signal
 import time
 
-from python_qt_binding.QtCore import QIODevice, QObject, QProcess, Signal
+from python_qt_binding.QtCore import (QObject, QProcess,
+                                      QProcessEnvironment, Signal)
 
 from . import common
 
@@ -21,9 +24,12 @@ from . import common
 class ToolRun(QObject):
     done = Signal(bool, float, str)   # ok, elapsed seconds, detail
 
-    def __init__(self, parent=None):
+    def __init__(self, tag, parent=None):
         super().__init__(parent)
+        self._tag = tag
         self._proc = None
+        self._log = None       # open file for the current job
+        self._partial = ''     # echoed text not yet ended by a newline
         self._tmp = None
         self._out = None
         self._t0 = 0.0
@@ -40,32 +46,76 @@ class ToolRun(QObject):
         """
         if self.running():
             return False, 'a job is already running'
-        conda = common.conda_exe()
-        if not conda:
+        prefix = common.conda_run_prefix()
+        if prefix is None:
             return False, 'conda not found (CONDA_EXE unset, not on PATH)'
         if not os.path.isfile(script):
             return False, f'script not found: {script}'
 
-        argv = [conda, 'run', '-n', common.CONDA_ENV, 'python', script, *args]
+        argv = [*prefix, 'python', script, *args]
+        header = f'=== {time.strftime("%Y-%m-%d %H:%M:%S")} {shlex.join(argv)}'
         try:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, 'a') as f:
-                f.write(f'\n=== {time.strftime("%Y-%m-%d %H:%M:%S")} '
-                        f'{shlex.join(argv)}\n')
+            self._log = open(log_path, 'a', buffering=1)
+            self._log.write('\n' + header + '\n')
         except OSError as e:
+            self._log = None
             return False, f'cannot write {log_path}: {e}'
+        # Full command in the file; a short version in the terminal.
+        first = os.path.basename(args[0]) if args else ''
+        self._echo_line(f'--- {os.path.basename(script)} {first} ---')
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.MergedChannels)
-        proc.setStandardOutputFile(log_path, QIODevice.Append)
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert('PYTHONUNBUFFERED', '1')   # tool prints arrive as they happen
+        proc.setProcessEnvironment(env)
+        proc.readyReadStandardOutput.connect(self._on_output)
         proc.finished.connect(self._on_finished)
         proc.errorOccurred.connect(self._on_error)
 
         self._proc, self._tmp, self._out = proc, tmp, out
+        self._partial = ''
         self._reported = False
         self._t0 = time.monotonic()
         proc.start('setsid', argv)
         return True, ''
+
+    # ------------------------------------------------------- output
+
+    def _on_output(self):
+        if self._proc is None:
+            return
+        text = bytes(self._proc.readAllStandardOutput()).decode(
+            'utf-8', errors='replace')
+        if not text:
+            return
+        if self._log is not None:
+            self._log.write(text)
+        if not common.ECHO_TOOL_LOGS:
+            return
+        lines = (self._partial + text).split('\n')
+        self._partial = lines.pop()
+        for line in lines:
+            self._echo_line(line)
+
+    def _echo_line(self, line):
+        if not common.ECHO_TOOL_LOGS:
+            return
+        # Progress bars redraw with '\r'; show only the final state.
+        parts = [p for p in line.split('\r') if p.strip()]
+        if parts:
+            print(f'[{self._tag}] {parts[-1].rstrip()}', flush=True)
+
+    def _close_log(self):
+        if self._partial:
+            self._echo_line(self._partial)
+            self._partial = ''
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+    # ------------------------------------------------------ results
 
     def _on_error(self, err):
         # Crashes are followed by finished(); only a failed start is not.
@@ -75,6 +125,7 @@ class ToolRun(QObject):
     def _on_finished(self, code, status):
         if self._reported:
             return   # killed, or already reported
+        self._on_output()   # anything still unread
         if status != QProcess.NormalExit:
             self._finish(False, 'tool crashed')
         elif code != 0:
@@ -93,6 +144,7 @@ class ToolRun(QObject):
         if self._reported:
             return
         self._reported = True
+        self._close_log()
         if not ok:
             self._remove_tmp()
         elapsed = time.monotonic() - self._t0
@@ -121,6 +173,7 @@ class ToolRun(QObject):
                 proc.kill()
             if proc.waitForFinished(wait_ms):
                 break
+        self._close_log()
         self._remove_tmp()
         proc.deleteLater()
         self._proc = None
