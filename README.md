@@ -19,12 +19,20 @@ map_pip_dlio_multinormals          map_pip_optitrack_tf  /  map_pip_optitrack_sl
             │                                            │
             └────────────────────┬───────────────────────┘
                                   ▼
+                       Per-scan crop sector
+              (range / azimuth / elevation, LiDAR frame)
+                                  │
+                                  ▼
                        Point-cloud accumulation
                 (voxel filter, duplicate removal,
                       statistical outlier removal)
                                   │
                                   ▼
                         Global map (.pcd)
+                                  │
+                                  ▼
+                   Cluster removal (optional)
+             (drop pots, walls, bench legs from the map)
                                   │
                     ┌─────────────┴─────────────┐
                     ▼                           ▼
@@ -43,7 +51,7 @@ map_pip_dlio_multinormals          map_pip_optitrack_tf  /  map_pip_optitrack_sl
                           UAV inspection path
 ```
 
-Collection, mesh generation, normal selection, and path generation are controlled through **`vision_pip_gui`**, an rqt panel (`src/vision_pip_gui/`). Shell pane scripts (`scripts/collect.sh`, `mesh.sh`, `select.sh`, `path.sh`) are kept as the reference implementation the GUI is ported from, and remain usable standalone.
+Collection, mesh generation, cluster removal, normal selection, and path generation are controlled through **`vision_pip_gui`**, an rqt panel (`src/vision_pip_gui/`). Shell pane scripts (`scripts/collect.sh`, `mesh.sh`, `select.sh`, `path.sh`) are kept as the reference implementation the GUI is ported from, and remain usable standalone.
 
 ---
 
@@ -64,7 +72,9 @@ vision_ws_git/
 ├── docs/
 │   ├── livox_mid360_setup.md
 │   ├── dlio_setup.md
-│   └── optitrack_setup.md              # network, naming, submodule workflow, debugging notes
+│   ├── optitrack_setup.md              # network, naming, submodule workflow, debugging notes
+│   ├── mesh_and_path_parameters.md     # every pcd_to_stl.py / offset_spline.py flag
+│   └── cluster_removal_and_fov.md      # cluster removal + crop sector design notes
 │
 ├── scripts/
 │   ├── common.sh                       # shared paths/helpers, sourced by every pane script
@@ -95,10 +105,30 @@ vision_ws_git/
     ├── vision_pip_gui/                 # rqt panel (ament_python)
     │   ├── package.xml  plugin.xml  setup.py  setup.cfg
     │   └── vision_pip_gui/
-    │       ├── pipeline_panel.py  common.py  services.py  tools.py  mesh_watcher.py
+    │       ├── pipeline_panel.py  common.py  services.py  tools.py
+    │       ├── mesh_watcher.py         # mesh.sh's loop as a Qt state machine
+    │       ├── cluster.py              # cluster-removal status, executor -> GUI thread hop
+    │       ├── subscriptions.py        # topic subscriptions (trunk offset)
+    │       └── params.py               # runtime-editable parameter fields
     │
     └── optitrack_packages_ros2/        # git submodule -> fork, project-specific config
 ```
+
+### Node names
+
+Node name and executable name differ — worth knowing, because **parameter**
+services are namespaced by node name while every Trigger service here is
+declared relative and resolves at the root:
+
+| Executable | Node name |
+|---|---|
+| `map_pip_optitrack_tf` | `map_pip_tf` |
+| `map_pip_optitrack_slerp` | `map_pip_optitrack` |
+| `mocap_tf_broadcaster` | `mocap_tf_broadcaster` |
+
+So `/start_collection` is `/start_collection` whatever the node is called, but
+`/map_pip_tf/set_parameters` is not — the panel's `NODE_NAME` must match or
+Apply fails. See [`docs/cluster_removal_and_fov.md`](docs/cluster_removal_and_fov.md) §3.
 
 ---
 
@@ -218,12 +248,18 @@ ros2 topic type /livox/lidar   # expect sensor_msgs/msg/PointCloud2
 | `/optitrack_multiplexer_node/rigid_body/Tin_LIDAR` | `RigidBodyStamped` | Mocap pose (OptiTrack path) |
 | `/global_map` | `sensor_msgs/PointCloud2` | Accumulated global map |
 | `/processed/mesh` | `visualization_msgs/MarkerArray` | Live/final mesh, in RViz |
+| `/processed/clusters` | `sensor_msgs/PointCloud2` (XYZRGB) | Colour-coded clusters, latched |
+| `/processed/cluster_status` | `std_msgs/String` | Cluster-removal state line, latched |
 | `/processed/selected_normals`, `/processed/path` | — | Selected contact normals, generated path |
 
 ### RViz
 
 - DLIO: `config/map_pip.rviz`
 - OptiTrack: `config/map_pip_optitrack.rviz`
+
+Cluster removal needs a `PointCloud2` display on `/processed/clusters` with
+**Color Transformer: RGB8**. Not yet in the committed `.rviz` configs — add it
+by hand for now.
 
 ### Tuning
 
@@ -233,24 +269,114 @@ All node/mesh/path parameters live in `scripts/pipeline_params.yaml`, read once 
 PARAMS_FILE=~/experiments/deep_mesh.yaml scripts/run_vision_pip_dlio
 ```
 
+A handful of fields (the crop sector, mesh depths, path offset) can also be
+changed at runtime from the panel — those go to the node via
+`/<node>/set_parameters` and take effect from the next Start, without editing
+the file on disk.
+
+---
+
+## Per-scan crop sector (FOV)
+
+Each incoming scan is cropped **before** it is accumulated, so only the trunk
+region enters the map. The crop is a wedge in spherical coordinates about the
+sensor origin, in the LiDAR frame:
+
+| Parameter | C++ default | `pipeline_params.yaml` | Meaning |
+|---|---|---|---|
+| `fov_min_range` | 0.10 | 0.1 | true radial distance \|p\|, not axial |
+| `fov_max_range` | 0.60 | 0.6 | |
+| `fov_min_azimuth_deg` | −20.0 | −20.0 | `atan2(y, x)`; 0° = +x boresight, +90° = +y |
+| `fov_max_azimuth_deg` | 20.0 | 20.0 | |
+| `fov_min_elevation_deg` | −20.0 | **20.0** | angle above the xy-plane; +90° = +z |
+| `fov_max_elevation_deg` | 20.0 | **50.0** | |
+
+The shipped elevation window is deliberately asymmetric and upward-looking,
+unlike the symmetric C++ default — it sits inside the Mid-360's real −7°/+52°
+range. The start-of-run log line tells you what is actually active:
+
+```text
+FOV sector: range [0.100, 0.600] m, azimuth -20 to 20 deg, elevation 20 to 50 deg
+```
+
+with `full 360 deg` / `unlimited` substituted where a limit is not binding.
+
+Two behaviours worth knowing:
+
+- **Azimuth wraps at ±180, elevation does not.** A minimum *above* the maximum
+  is legal for azimuth and means a wedge straddling the back of the sensor
+  (`170 → -170` is a 20° wedge, not a 340° one). For elevation it is simply an
+  error — the node swaps the two and warns.
+- **The sector's apex is the sensor**, so the wedge sweeps with the drone. At
+  ±20° azimuth you admit a 42 cm arc at 0.6 m but only 7 cm at 0.1 m. If the
+  trunk fills the frame close in, no single azimuth is right at both ends.
+
+`fov_min_range` also drops the `(0,0,0)` no-return beams, which is what the
+removed `min_range` parameter used to do. The old axis-aligned box
+(`min_x`…`max_z`) is gone; the separate **world-frame** `final_*` crop applied
+at the end of a run is unrelated and still a box.
+
+Full design notes: [`docs/cluster_removal_and_fov.md`](docs/cluster_removal_and_fov.md) §2.
+
+---
+
+## Cluster removal
+
+A trunk scan should end up as one connected cluster. Anything else that got
+through the crop — a pot, a wall, a bench leg — is a separate cluster, and
+deleting it from the finished map is cheaper than re-scanning with a tighter
+crop. The feature only arms when more than one cluster is found, so on a clean
+scan it tells you so and changes nothing.
+
+```text
+Remove cluster ──► /cluster_map              cluster; refuses if <= 1 cluster
+click in RViz  ──► /clicked_point            mark pending, panel pops a dialog
+Yes            ──► /confirm_cluster_removal  points deleted
+No             ──► /cancel_cluster_removal   nothing changes
+```
+
+Nothing is deleted until confirm arrives — that is what lets a dialog sit
+between the click and the deletion. While armed, an RViz click picks a
+**cluster** instead of a normal; the same tool, two meanings.
+
+Parameters (`scripts/pipeline_params.yaml`):
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `cluster_voxel` | 0.01 | leaf size of the voxelised copy that gets clustered (m) |
+| `cluster_tolerance` | 0.03 | join radius (m); must exceed `cluster_voxel` |
+| `cluster_min_points` | 10 | counted in **voxels**, not raw points |
+| `cluster_max_points` | 10000000 | |
+| `cluster_click_radius` | 0.10 | a click further than this from any clustered point is ignored (m) |
+
+Clustering runs on a voxelised *copy* — accumulation dedups at
+`duplicate_distance` (5 mm), which is far too dense to cluster inside a service
+callback — but deletion runs on the real map, via a KdTree radius search,
+because the cluster holds voxel centres rather than real map points.
+
+**After removing a cluster the mesh is stale**, since the cloud on disk is
+rewritten under the same filename. While collecting, the node writes a fresh
+snapshot and live meshing picks it up on its own; after collecting, the panel
+offers to rebuild the final mesh (`MeshWatcher.remesh()`). The node's *own*
+copy of the mesh is not reloaded either way — click-to-select and the cylinder
+fit will read the pre-removal mesh until the next run. See
+[`docs/cluster_removal_and_fov.md`](docs/cluster_removal_and_fov.md) §4 gap 1.
+
 ---
 
 ## Running
 
 ```bash
 scripts/run_vision_pip_dlio              # DLIO pose source
-scripts/run_vision_pip_optitrack_tf      # OptiTrack, TF lookup + mocap_tf_broadcaster
+scripts/run_vision_pip_optitrack_tf      # [LATEST] OptiTrack, TF lookup + mocap_tf_broadcaster
 scripts/run_vision_pip_optitrack_slerp   # OptiTrack, buffered pose interpolation
 ```
 
-Then, the control panel:
-
-```bash
-ros2 run rqt_gui rqt_gui
-# Plugins -> Vision Pipeline
-```
-
-Start/end collection, undo/save/load/clear normals, and generate/publish a path all happen from the panel. RViz clicks select normals; the panel's buttons drive everything else via `std_srvs/Trigger` service calls to the running node.
+Start/end collection, undo/save/load/clear normals, remove clusters, edit the
+crop sector, and generate/publish a path all happen from the panel. RViz clicks
+select normals (or clusters, while cluster removal is armed); the panel's
+buttons drive everything else via `std_srvs/Trigger` service calls to the
+running node.
 
 ---
 
@@ -278,8 +404,9 @@ vision_ws_outputs/
     ├── normals/  selected_normals_<ts>.yaml
     ├── paths/    path_<ts>.yaml, path_<ts>.csv
     ├── logs/     mesh.log, path.log
-    └── params.yaml   # pipeline_params.yaml snapshot for this run
-locked_target.yaml    # persistent, reused across runs
+    ├── params.yaml        # pipeline_params.yaml snapshot, written at Start
+    └── params_NNN.yaml    # one per runtime parameter change from the panel
+locked_target.yaml         # persistent, reused across runs
 ```
 
 ---
@@ -298,6 +425,8 @@ Can be run standalone for tuning:
 python3 scripts/lidar-tools/pcd_to_stl.py --help
 ```
 
+Every flag and its measured effect: [`docs/mesh_and_path_parameters.md`](docs/mesh_and_path_parameters.md).
+
 ---
 
 ## Troubleshooting
@@ -312,7 +441,13 @@ python3 scripts/lidar-tools/pcd_to_stl.py --help
 
 **RViz shows no point cloud** — check the TF tree (`ros2 run tf2_tools view_frames`) and the cloud's actual frame (`ros2 topic echo /dlio/odom_node/pointcloud/deskewed --once`) against RViz's fixed frame.
 
-**`colcon build` fails with `ModuleNotFoundError: No module named 'catkin_pkg'`** (or `'yaml'`) — an active conda environment is shadowing system Python on `PATH`. Run `conda deactivate` before building or running anything through `ros2`/`colcon`.
+**Almost nothing accumulates into the map** — the per-scan crop sector is probably aimed wrong. Check the `FOV sector:` line in the start-of-run log against where the trunk actually is, and remember the sector's apex is the sensor, so it sweeps with the drone.
+
+**`/cluster_map` refuses with `success=false`** — that is the intended answer when the map is a single connected cluster. If you expected several, `cluster_tolerance` may be large enough to bridge them, or `cluster_min_points` (counted in voxels) large enough to discard them.
+
+**Panel's Apply fails with `/<something>/set_parameters is not available`** — the panel's `NODE_NAME` does not match the running node's name. Check `ros2 node list`; for the TF variant it is `map_pip_tf`, not the package or executable name.
+
+**`colcon build` fails with `ModuleNotFoundError: No module named 'catkin_pkg'`** (or `'yaml'`) — conda's Python is shadowing system Python. Run `conda deactivate` before building or running anything through `ros2`/`colcon`. If it persists after deactivating, CMake has cached the wrong interpreter: `rm -rf build install log` and rebuild with `--cmake-args -DPYTHON_EXECUTABLE=/usr/bin/python3`.
 
 **`ros2 run cloud_pipeline <exe>` can't find the executable after a rename** — check `project(...)` at the top of `CMakeLists.txt` matches `package.xml`'s `<name>`; `install(TARGETS ... DESTINATION lib/${PROJECT_NAME})` resolves from `project()`, independently of `package.xml`.
 
@@ -326,6 +461,7 @@ Full debugging log from the DLIO → OptiTrack/rqt migration: [`docs/optitrack_s
 
 ```bash
 cd ~/vision_ws_git
+conda deactivate
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install --packages-up-to cloud_pipeline vision_pip_gui
 source install/setup.bash
@@ -335,6 +471,10 @@ source install/setup.bash
 git status
 git diff --check       # whitespace errors before committing
 ```
+
+`pipeline_params.yaml` and `params.py` are read from `install/.../share/`, so
+editing the source copies and relaunching silently re-reads the stale installed
+ones unless you rebuild (or used `--symlink-install`).
 
 ---
 
@@ -369,15 +509,18 @@ git commit -m "Pin optitrack_packages_ros2 submodule to <what changed>"
 - [`docs/dlio_setup.md`](docs/dlio_setup.md) — DLIO setup
 - [`docs/optitrack_setup.md`](docs/optitrack_setup.md) — network/naming, fork+submodule workflow, build dependency ordering, debugging notes
 - [`docs/mesh_and_path_parameters.md`](docs/mesh_and_path_parameters.md) — every `pcd_to_stl.py` / `offset_spline.py` flag, with measured effects
+- [`docs/cluster_removal_and_fov.md`](docs/cluster_removal_and_fov.md) — cluster removal and crop-sector design notes, known gaps, test checklist
 
 ---
 
 ## Project status
 
 - DLIO and OptiTrack pose sources, both feeding the same mapping/meshing/normal-selection/path pipeline
+- Per-scan spherical crop sector, runtime-adjustable from the panel
 - Live and final mesh reconstruction (Poisson), interactive multi-normal selection with undo, locked-target persistence
-- `vision_pip_gui` rqt panel controlling collection, selection, and path generation
-- **Known issue:** clean-clone build currently fails (see Troubleshooting) — fix pending
+- Cluster removal for stripping non-trunk geometry from a finished map
+- `vision_pip_gui` rqt panel controlling collection, cluster removal, parameters, selection, and path generation
+- **Known issues:** clean-clone build currently fails (see Troubleshooting); the node does not reload its own mesh after a post-removal rebuild; `/processed/clusters` is not yet in the committed RViz configs
 
 ## License
 
