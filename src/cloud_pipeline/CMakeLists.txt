@@ -35,9 +35,7 @@ find_package(PCL REQUIRED COMPONENTS common filters features search io segmentat
 
 add_executable(map_pip src/map_pip.cpp)
 add_executable(map_pip_mocap src/map_pip_mocap.cpp)
-add_executable(map_pip_mocap_normals src/map_pip_mocap_normals.cpp)
 add_executable(map_pip_dlio_multinormals src/map_pip_dlio_multinormals.cpp)
-add_executable(map_pip_dlio_multinormals_test src/map_pip_dlio_multinormals_test.cpp)
 add_executable(map_pip_optitrack_slerp src/map_pip_optitrack_slerp.cpp)
 add_executable(map_pip_optitrack_tf src/map_pip_optitrack_tf.cpp)
 add_executable(mocap_tf_broadcaster src/mocap_tf_broadcaster.cpp)
@@ -75,20 +73,6 @@ ament_target_dependencies(map_pip_mocap
   pcl_conversions
 )
 
-ament_target_dependencies(map_pip_mocap_normals
-  rclcpp
-  sensor_msgs
-  visualization_msgs
-  geometry_msgs
-  yaml-cpp
-  std_srvs
-  tf2
-  tf2_ros
-  tf2_eigen
-  tf2_geometry_msgs
-  pcl_conversions
-)
-
 ament_target_dependencies(map_pip_dlio_multinormals
   rclcpp
   sensor_msgs
@@ -104,20 +88,6 @@ ament_target_dependencies(map_pip_dlio_multinormals
   pcl_conversions
 )
 
-ament_target_dependencies(map_pip_dlio_multinormals_test
-  rclcpp
-  sensor_msgs
-  visualization_msgs
-  geometry_msgs
-  yaml-cpp
-  std_srvs
-  nav_msgs
-  tf2
-  tf2_ros
-  tf2_eigen
-  tf2_geometry_msgs
-  pcl_conversions
-)
 
 ament_target_dependencies(mocap_tf_broadcaster
   rclcpp
@@ -162,12 +132,6 @@ ament_target_dependencies(map_pip_optitrack_tf
 target_link_libraries(map_pip ${PCL_LIBRARIES})
 target_include_directories(map_pip PRIVATE ${PCL_INCLUDE_DIRS})
 
-target_link_libraries(map_pip_mocap_normals
-  ${PCL_LIBRARIES}
-  Eigen3::Eigen
-  yaml-cpp
-)
-
 target_link_libraries(map_pip_dlio_multinormals
   ${PCL_LIBRARIES}
   Eigen3::Eigen
@@ -175,15 +139,6 @@ target_link_libraries(map_pip_dlio_multinormals
 )
 
 target_include_directories(map_pip_dlio_multinormals PRIVATE
-  ${PCL_INCLUDE_DIRS}
-)
-target_link_libraries(map_pip_dlio_multinormals_test
-  ${PCL_LIBRARIES}
-  Eigen3::Eigen
-  yaml-cpp
-)
-
-target_include_directories(map_pip_dlio_multinormals_test PRIVATE
   ${PCL_INCLUDE_DIRS}
 )
 
@@ -211,9 +166,7 @@ install(
   TARGETS 
   map_pip
   map_pip_mocap
-  map_pip_mocap_normals
   map_pip_dlio_multinormals
-  map_pip_dlio_multinormals_test
   map_pip_optitrack_slerp
   mocap_tf_broadcaster
   map_pip_optitrack_tf
