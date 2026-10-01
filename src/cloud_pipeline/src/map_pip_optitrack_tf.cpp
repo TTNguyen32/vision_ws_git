@@ -31,6 +31,7 @@
 #include <sstream>
 #include <iomanip>
 #include <ctime>
+#include <cstring>                  
 
 #include <std_srvs/srv/trigger.hpp>
 #include <yaml-cpp/yaml.h>
@@ -47,8 +48,11 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 
 #include <nav_msgs/msg/path.hpp>
+
+#include <std_msgs/msg/string.hpp>          // cluster status line for the GUI
 
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
@@ -61,6 +65,7 @@
 #include <pcl/io/vtk_lib_io.h>          // loadPolygonFileSTL
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/segmentation/sac_segmentation.h>  // SACSegmentationFromNormals for cylinder fit
+#include <pcl/segmentation/extract_clusters.h>  // EuclideanClusterExtraction for cluster removal
 
 #include <Eigen/Geometry>
 
@@ -88,6 +93,38 @@ private:
 
 using PointT = pcl::PointXYZ; // create a convenient alias of PointXYZ
 Timer t; // declare a timer 
+
+// Find the first field matching any of `names`, or nullptr.
+static const sensor_msgs::msg::PointField *
+findField(const sensor_msgs::msg::PointCloud2 &msg,
+          const std::vector<std::string> &names)
+{
+    for (const auto &n : names)
+        for (const auto &f : msg.fields)
+            if (f.name == n) return &f;
+    return nullptr;
+}
+
+// Read point i's value of field f as a double, whatever its storage type.
+// memcpy, not a cast: Livox puts `timestamp` at offset 18, which is not
+// 8-byte aligned, so reinterpreting the pointer is undefined behaviour.
+static double readFieldAsDouble(const sensor_msgs::msg::PointCloud2 &msg,
+                                const sensor_msgs::msg::PointField &f,
+                                std::size_t i)
+{
+    const uint8_t *p = msg.data.data() + i * msg.point_step + f.offset;
+    switch (f.datatype)
+    {
+        case sensor_msgs::msg::PointField::FLOAT64:
+        { double v;   std::memcpy(&v, p, 8); return v; }
+        case sensor_msgs::msg::PointField::FLOAT32:
+        { float v;    std::memcpy(&v, p, 4); return static_cast<double>(v); }
+        case sensor_msgs::msg::PointField::UINT32:
+        { uint32_t v; std::memcpy(&v, p, 4); return static_cast<double>(v); }
+        default:
+            return std::numeric_limits<double>::quiet_NaN();
+    }
+}
 
 struct SelectedTarget
 {
@@ -142,6 +179,12 @@ public:
         trajectory_min_dist_   = declare_parameter<double>("trajectory_min_dist", 0.005);   // m, 0 keeps every sample
         trajectory_max_points_ = declare_parameter<int>("trajectory_max_points", 20000);    // <= 0 unbounded
 
+        // Offset from the drone to the middle of the fitted trunk axis,
+        // in frame_id_. Published only while a cylinder fit is current.
+        publish_offset_     = declare_parameter<bool>("publish_offset", true);
+        offset_topic_       = declare_parameter<std::string>("offset_topic", "/processed/trunk_offset");
+        offset_period_sec_  = declare_parameter<double>("offset_period_sec", 0.05);   // 20 Hz
+
         if (drone_frame_.empty()) drone_frame_ = body_frame_;
 
         // Buffer caches every transform heard on /tf and /tf_static, keeping
@@ -151,6 +194,13 @@ public:
         tf_buffer_   = std::make_shared<tf2_ros::Buffer>(
             get_clock(), tf2::durationFromSec(tf_buffer_sec_));
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+                // ----------------
+        // DESKEW
+        // A Livox frame spans ~100 ms (measured 99.56 ms). One pose for all
+        // of it smears the cloud by speed x 100 ms. Buckets cut that by ~10x.
+        deskew_         = declare_parameter<bool>("deskew", true);
+        deskew_buckets_ = declare_parameter<int>("deskew_buckets", 10);
 
         // MEMORIES
         save_path_ = declare_parameter<std::string>("save_path","");       
@@ -176,21 +226,37 @@ public:
         snapshot_period_sec_ = declare_parameter<double>("snapshot_period_sec", 5.0);
 
 
-        // downsampling parameters
-        min_x_ = declare_parameter<double>("min_x", 0);
-        max_x_ = declare_parameter<double>("max_x",  0.5);
+        // ----------------
+        // PER-SCAN CROP SECTOR, in the LiDAR frame.
+        //
+        // Spherical coordinates about the sensor origin: a wedge in
+        // azimuth, a wedge in elevation, and a shell between two radii.
+        // This is the sensor's own coordinate system, so a window set
+        // here maps directly onto what the Mid-360 can physically see.
+        //
+        //   azimuth   = atan2(y, x)            0 deg = +x boresight,
+        //                                     +90 deg = +y, wraps at 180
+        //   elevation = angle above the xy plane,  +90 deg = +z
+        //   range     = |p|, true radial distance (not axial)
+        //
+        // Mid-360 hardware limits, for reference when choosing these:
+        //   azimuth    360 deg (no limit)
+        //   elevation  -7 to +52 deg
+        //   range      0.1 m close-proximity blind zone
+        // Asking for more than the sensor provides is harmless; it just
+        // means the limit never binds.
+        //
+        // fov_min_range also does the job the old min_range parameter
+        // did: the Mid-360 reports no-return beams as (0,0,0), and any
+        // positive inner radius drops them.
+        fov_min_range_        = declare_parameter<double>("fov_min_range", 0.10);
+        fov_max_range_        = declare_parameter<double>("fov_max_range", 0.60);
+        fov_min_azimuth_deg_  = declare_parameter<double>("fov_min_azimuth_deg", -20.0);
+        fov_max_azimuth_deg_  = declare_parameter<double>("fov_max_azimuth_deg",  20.0);
+        fov_min_elevation_deg_ = declare_parameter<double>("fov_min_elevation_deg", -20.0);
+        fov_max_elevation_deg_ = declare_parameter<double>("fov_max_elevation_deg",  20.0);
 
-        min_y_ = declare_parameter<double>("min_y", -0.2);
-        max_y_ = declare_parameter<double>("max_y",  0.2);
-
-        min_z_ = declare_parameter<double>("min_z", 0);
-        max_z_ = declare_parameter<double>("max_z",  0.2);
-
-        // Blind-zone filter, in the LiDAR frame. The Mid-360 reports
-        // no-return beams as (0,0,0), and the box above is inclusive at 0,
-        // so they pass. After transforming, they pile up at the LiDAR's
-        // world position every scan. Its minimum range is ~0.1 m anyway.
-        min_range_ = declare_parameter<double>("min_range", 0.05);
+        updateFovDerived();
 
         // Final crop box, applied in the WORLD frame to snapshots and the
         // final map. The world origin is the mocap origin, not the sensor,
@@ -209,6 +275,26 @@ public:
         // SOR denoising parameters
         sor_mean_k_             = declare_parameter<int>("sor_mean_k", 1000);
         sor_stddev_mult_        = declare_parameter<double>("sor_stddev_mult", 10.0);
+
+        // ----------------
+        // CLUSTER REMOVAL
+        // The map is clustered on a VOXELISED COPY, never on global_map_
+        // itself: Euclidean clustering is O(n log n) with a big constant,
+        // and at duplicate_distance_ = 1 mm the real map is far too dense
+        // to cluster inside a service callback.
+        cluster_voxel_        = declare_parameter<double>("cluster_voxel", 0.01);
+        // Two points join the same cluster if they are within this of each
+        // other. Must exceed cluster_voxel_, or every voxel is its own
+        // cluster. Rule of thumb: the widest real gap inside the trunk
+        // surface, and smaller than the gap to the nearest other object.
+        cluster_tolerance_    = declare_parameter<double>("cluster_tolerance", 0.05);
+        cluster_min_points_   = declare_parameter<int>("cluster_min_points", 50);
+        cluster_max_points_   = declare_parameter<int>("cluster_max_points", 10000000);
+        // A click further than this from any clustered point is ignored,
+        // so a stray click on empty space cannot delete anything.
+        cluster_click_radius_ = declare_parameter<double>("cluster_click_radius", 0.10);
+        clusters_topic_       = declare_parameter<std::string>("clusters_topic", "/processed/clusters");
+        cluster_status_topic_ = declare_parameter<std::string>("cluster_status_topic", "/processed/cluster_status");
 
         // Cylinder RANSAC parameters
         max_ransac_iterations_        = declare_parameter<int>("max_ransac_iterations", 1000);
@@ -270,6 +356,16 @@ public:
         path_pub_ = create_publisher<nav_msgs::msg::Path>(
             path_topic_, rclcpp::QoS(1).transient_local());
 
+        // Colour-coded clusters for RViz, and a one-line status the GUI
+        // subscribes to. Both transient_local: the panel and RViz latch on
+        // whenever they connect, which is how the panel learns that a click
+        // has landed without polling for it.
+        clusters_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+            clusters_topic_, rclcpp::QoS(1).transient_local());
+
+        cluster_status_pub_ = create_publisher<std_msgs::msg::String>(
+            cluster_status_topic_, rclcpp::QoS(1).transient_local());
+
         // Drone trajectory. transient_local so RViz sees the path so far
         // even if it (re)connects mid-flight.
         trajectory_pub_ = create_publisher<nav_msgs::msg::Path>(
@@ -286,6 +382,19 @@ public:
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::duration<double>(trajectory_period_sec_)),
                 std::bind(&MapPipeline::sampleTrajectory, this));
+        }
+
+        // Drone -> trunk axis midpoint. Plain volatile QoS: this is a live
+        // measurement, and a stale one is worse than none.
+        offset_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
+            offset_topic_, rclcpp::QoS(10));
+
+        if (publish_offset_)
+        {
+            offset_timer_ = create_wall_timer(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::duration<double>(offset_period_sec_)),
+                std::bind(&MapPipeline::publishTrunkOffset, this));
         }
 
         // Poll until frame_id <- lidar_frame resolves, then stop.
@@ -381,6 +490,24 @@ public:
             "clear_trajectory",
             std::bind(&MapPipeline::clearTrajectoryService, this,
                       std::placeholders::_1, std::placeholders::_2));
+
+        // Cluster removal: arm -> click in RViz -> confirm / cancel.
+        cluster_map_srv_ = create_service<std_srvs::srv::Trigger>(
+            "cluster_map",
+            std::bind(&MapPipeline::clusterMapService, this,
+                      std::placeholders::_1, std::placeholders::_2));
+
+        confirm_cluster_srv_ = create_service<std_srvs::srv::Trigger>(
+            "confirm_cluster_removal",
+            std::bind(&MapPipeline::confirmClusterRemovalService, this,
+                      std::placeholders::_1, std::placeholders::_2));
+
+        cancel_cluster_srv_ = create_service<std_srvs::srv::Trigger>(
+            "cancel_cluster_removal",
+            std::bind(&MapPipeline::cancelClusterRemovalService, this,
+                      std::placeholders::_1, std::placeholders::_2));
+
+        publishClusterStatus("idle");
         
 
         RCLCPP_INFO(get_logger(),
@@ -403,14 +530,12 @@ public:
 
 private:
 
-    // ---- frame_id <- source_frame at a given stamp, from the TF buffer ----
-    // This is the whole pose path. tf2 walks world -> body -> lidar and
-    // interpolates the dynamic world -> body edge to `stamp`, which is what
-    // lookupMocapPose() used to do by hand (lerp on position, slerp on
-    // rotation). tf2 never extrapolates: a stamp outside the buffered
-    // interval throws rather than guessing.
+    // Explicit-timeout form. Bucket lookups pass 0: the whole-scan lookup
+    // already waited, so the data is in the buffer and blocking 10 times
+    // over would stall the callback for a second.
     bool lookupLidarPose(const std::string &source_frame,
                          const rclcpp::Time &stamp,
+                         double timeout_sec,
                          Eigen::Isometry3d &T_world_lidar,
                          std::string &reason)
     {
@@ -421,8 +546,8 @@ private:
                     frame_id_,          // target: express points in the map frame
                     source_frame,       // source: the frame the scan was taken in
                     stamp,              // AT THE SCAN'S OWN TIME, not "latest"
-                    tf2::durationFromSec(tf_lookup_timeout_sec_));  // wait this long for it
-            T_world_lidar = tf2::transformToEigen(tf_msg);   // -> Eigen::Isometry3d
+                    tf2::durationFromSec(timeout_sec));
+            T_world_lidar = tf2::transformToEigen(tf_msg);
             return true;
         }
         catch (const tf2::TransformException &ex)
@@ -430,6 +555,130 @@ private:
             reason = ex.what();
             return false;
         }
+    }
+
+    bool lookupLidarPose(const std::string &source_frame,
+                         const rclcpp::Time &stamp,
+                         Eigen::Isometry3d &T_world_lidar,
+                         std::string &reason)
+    {
+        return lookupLidarPose(source_frame, stamp, tf_lookup_timeout_sec_,
+                               T_world_lidar, reason);
+    }
+
+    // ---- Deskew ----
+    // Splits the scan into time buckets by each point's own timestamp, looks
+    // up a pose per bucket, and transforms each bucket with its own pose.
+    // Filtering stays in the LiDAR frame, exactly as the single-pose path.
+    // Returns false (and leaves world_scan alone) if deskewing isn't possible,
+    // so the caller can fall back.
+    bool deskewScan(const sensor_msgs::msg::PointCloud2 &msg,
+                    pcl::PointCloud<pcl::PointXYZ>::Ptr &world_scan,
+                    double &skew_mm,
+                    std::string &reason)
+    {
+        const auto *t_field = findField(
+            msg, {"timestamp", "t", "time", "time_stamp", "offset_time"});
+        if (!t_field) { reason = "no per-point time field"; return false; }
+
+        const std::size_t n = static_cast<std::size_t>(msg.width) * msg.height;
+        if (n == 0) { reason = "empty cloud"; return false; }
+
+        const rclcpp::Time scan_stamp(msg.header.stamp, RCL_ROS_TIME);
+
+        // Units, decided once from the first value. Livox PointCloud2 mode
+        // writes absolute epoch nanoseconds as float64 (~1.79e18).
+        const double v0 = readFieldAsDouble(msg, *t_field, 0);
+        if (!std::isfinite(v0)) { reason = "unsupported time datatype"; return false; }
+
+        double scale; bool absolute;
+        if      (v0 > 1e15) { scale = 1e-9; absolute = true;  }   // epoch ns
+        else if (v0 > 1e6)  { scale = 1e-9; absolute = false; }   // relative ns
+        else                { scale = 1.0;  absolute = false; }   // relative s
+
+        const double base = absolute ? scan_stamp.seconds() : 0.0;
+        auto rel_time = [&](std::size_t i) {
+            return readFieldAsDouble(msg, *t_field, i) * scale - base;
+        };
+
+        // Pass 1: the span the cloud covers. Points are NOT in time order on
+        // the Mid-360 (non-repetitive pattern), so this must scan them all.
+        double t_lo = std::numeric_limits<double>::max();
+        double t_hi = std::numeric_limits<double>::lowest();
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const double t = rel_time(i);
+            if (!std::isfinite(t)) continue;
+            t_lo = std::min(t_lo, t);
+            t_hi = std::max(t_hi, t);
+        }
+        const double span = t_hi - t_lo;
+        if (!(span > 1e-4)) { reason = "time span ~0"; return false; }
+
+        // Wait ONCE, for the pose covering the end of the scan. If that
+        // arrives, every earlier bucket is already buffered.
+        Eigen::Isometry3d probe;
+        if (!lookupLidarPose(msg.header.frame_id,
+                             scan_stamp + rclcpp::Duration::from_seconds(t_hi),
+                             tf_lookup_timeout_sec_, probe, reason))
+            return false;
+
+        const int nb = std::max(1, deskew_buckets_);
+        const double dt = span / nb;
+        std::vector<Eigen::Isometry3d> pose(nb);
+        std::vector<char> pose_ok(nb, -1);      // -1 untried, 0 failed, 1 good
+
+        auto bucket_pose = [&](int b) -> bool {
+            if (pose_ok[b] >= 0) return pose_ok[b] == 1;
+            const rclcpp::Time t = scan_stamp + rclcpp::Duration::from_seconds(
+                t_lo + (b + 0.5) * dt);          // bucket centre
+            std::string why;
+            pose_ok[b] = lookupLidarPose(msg.header.frame_id, t, 0.0,
+                                         pose[b], why) ? 1 : 0;
+            return pose_ok[b] == 1;
+        };
+
+        // Pass 2: filter in the LiDAR frame, then transform per bucket.
+        sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");
+        sensor_msgs::PointCloud2ConstIterator<float> it_y(msg, "y");
+        sensor_msgs::PointCloud2ConstIterator<float> it_z(msg, "z");
+
+        world_scan->clear();
+        world_scan->reserve(n / 4);
+
+        for (std::size_t i = 0; i < n; ++i, ++it_x, ++it_y, ++it_z)
+        {
+            const float x = *it_x, y = *it_y, z = *it_z;
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+
+            // also drops the (0,0,0) no-return points, via fov_min_range
+            if (!inFov(x, y, z)) continue;
+
+            const double t = rel_time(i);
+            if (!std::isfinite(t)) continue;
+
+            // clamp: the latest point sits exactly on the upper edge
+            int b = static_cast<int>((t - t_lo) / dt);
+            b = std::clamp(b, 0, nb - 1);
+            if (!bucket_pose(b)) { ++deskew_pose_misses_; continue; }
+
+            const Eigen::Vector3d p_w = pose[b] * Eigen::Vector3d(x, y, z);
+            world_scan->push_back(pcl::PointXYZ(
+                static_cast<float>(p_w.x()),
+                static_cast<float>(p_w.y()),
+                static_cast<float>(p_w.z())));
+        }
+
+        // Sensor travel across the scan: the error just removed.
+        int first = -1, last = -1;
+        for (int b = 0; b < nb; ++b)
+            if (pose_ok[b] == 1) { if (first < 0) first = b; last = b; }
+        skew_mm = (first >= 0 && last > first)
+            ? (pose[last].translation() - pose[first].translation()).norm() * 1e3
+            : 0.0;
+
+        if (world_scan->empty()) { reason = "all points filtered or unposed"; return false; }
+        return true;
     }
 
     // One-off log of the static extrinsic actually in TF, so the boot log
@@ -468,6 +717,36 @@ private:
     // One timer tick: read world -> drone_frame from TF, append it to a
     // nav_msgs::msg::Path and republish. The whole path is resent each time;
     // that is what RViz's Path display expects, and at 20 Hz it is cheap.
+    // Vector from the drone to the middle of the fitted trunk axis, in
+    // frame_id_. Same TF poll as sampleTrajectory(): whatever publishes
+    // frame_id_ -> drone_frame_ drives this too.
+    void publishTrunkOffset()
+    {
+        if (!has_cylinder_) return;   // no fit yet, or cleared
+
+        geometry_msgs::msg::TransformStamped tf_msg;
+        try
+        {
+            tf_msg = tf_buffer_->lookupTransform(
+                frame_id_, drone_frame_, tf2::TimePointZero);
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Offset: no TF '%s' -> '%s' (%s).",
+                frame_id_.c_str(), drone_frame_.c_str(), ex.what());
+            return;
+        }
+
+        geometry_msgs::msg::Vector3Stamped msg;
+        msg.header.frame_id = frame_id_;
+        msg.header.stamp    = tf_msg.header.stamp;   // the pose this was measured against
+        msg.vector.x = last_cylinder_mid_.x() - tf_msg.transform.translation.x;
+        msg.vector.y = last_cylinder_mid_.y() - tf_msg.transform.translation.y;
+        msg.vector.z = last_cylinder_mid_.z() - tf_msg.transform.translation.z;
+        offset_pub_->publish(msg);
+    }
+
     void sampleTrajectory()
     {
         geometry_msgs::msg::TransformStamped tf_msg;
@@ -568,65 +847,53 @@ private:
         }
         return out;
     }
-
+    
     // COLLECTION SERVICES
     void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
         if (!collecting_) return;
 
-        // receiving point cloud to be Ptr scan. 
-        pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>);
-
-        pcl::fromROSMsg(*msg, *scan);
-        if (scan->empty()) return;
-
-        // BOUND: range filter into a sane working box
-        pcl::PointCloud<pcl::PointXYZ>::Ptr bounded_scan(new pcl::PointCloud<pcl::PointXYZ>);
-
-        bounded_scan->reserve(scan->size());
-
-        const float min_range_sq = static_cast<float>(min_range_ * min_range_);
-
-        for (const auto &p : scan->points)
-        {
-            // drops the (0,0,0) no-return points and near-field junk
-            if (p.x * p.x + p.y * p.y + p.z * p.z < min_range_sq) continue;
-
-            if (p.x >= min_x_ && p.x <= max_x_ &&
-                p.y >= min_y_ && p.y <= max_y_ &&
-                p.z >= min_z_ && p.z <= max_z_)
-            {
-                bounded_scan->push_back(p); // add point into scan of reserved size. 
-            }
-        }
-
-        // TRANSFORM: lidar -> world, from TF at the scan's stamp.
-        // No transform -> drop the scan: a bad pose permanently corrupts the
-        // map, a missing one costs nothing.
-        Eigen::Isometry3d T_world_lidar;
-        std::string reason;
-
-        if (!lookupLidarPose(msg->header.frame_id,
-                             rclcpp::Time(msg->header.stamp, RCL_ROS_TIME),
-                             T_world_lidar, reason))
-        {
-            ++scans_dropped_;
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                "Dropping scan (%zu dropped so far): %s. If this never clears, "
-                "check that the mocap bridge and the LiDAR agree on the ROS "
-                "clock, or raise tf_lookup_timeout_sec.",
-                scans_dropped_, reason.c_str());
-            return;
-        }
-
-        // create a transformed cloud in world frame
         pcl::PointCloud<pcl::PointXYZ>::Ptr world_scan(
             new pcl::PointCloud<pcl::PointXYZ>);
+        double skew_mm = 0.0;
+        std::string reason;
 
-        pcl::transformPointCloud(
-            *bounded_scan,
-            *world_scan,
-            T_world_lidar.cast<float>().matrix());
+        if (!deskew_ || !deskewScan(*msg, world_scan, skew_mm, reason))
+        {
+            if (deskew_)
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "Deskew unavailable (%s). Falling back to one pose per scan.",
+                    reason.c_str());
+
+            // ---- original single-pose path ----
+            pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::fromROSMsg(*msg, *scan);
+            if (scan->empty()) return;
+
+            pcl::PointCloud<pcl::PointXYZ>::Ptr bounded_scan(
+                new pcl::PointCloud<pcl::PointXYZ>);
+            bounded_scan->reserve(scan->size());
+
+            for (const auto &p : scan->points)
+                if (inFov(p.x, p.y, p.z)) bounded_scan->push_back(p);
+
+            Eigen::Isometry3d T_world_lidar;
+            if (!lookupLidarPose(msg->header.frame_id,
+                                 rclcpp::Time(msg->header.stamp, RCL_ROS_TIME),
+                                 T_world_lidar, reason))
+            {
+                ++scans_dropped_;
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "Dropping scan (%zu dropped so far): %s. If this never clears, "
+                    "check that the mocap bridge and the LiDAR agree on the ROS "
+                    "clock, or raise tf_lookup_timeout_sec.",
+                    scans_dropped_, reason.c_str());
+                return;
+            }
+
+            pcl::transformPointCloud(*bounded_scan, *world_scan,
+                                     T_world_lidar.cast<float>().matrix());
+        }
 
         pcl::PointCloud<pcl::PointXYZ>::Ptr new_points(
         new pcl::PointCloud<pcl::PointXYZ>);
@@ -670,10 +937,11 @@ private:
 
         RCLCPP_INFO(
             get_logger(),
-            "Scan: %zu points | New: %zu | Map: %zu",
+            "Scan: %zu points | New: %zu | Map: %zu | skew: %.1f mm",
             world_scan->size(),
             new_points->size(),
-            global_map_->size());
+            global_map_->size(),
+            skew_mm);
 
         // create an empty ROS pointcloud2 msg
         sensor_msgs::msg::PointCloud2 out;
@@ -689,10 +957,110 @@ private:
         out.header.frame_id = frame_id_; // current frame is 'odom'. tells Rviz that global_map is in 'odom' coord. 
         global_map_pub_->publish(out); // send the map onto the topic oif global_map_pub
     }
+        
 
         // Periodic while collecting: pick up the newest live_*.stl the mesh loop
     // has produced and swap it in, so click-to-select tracks the scan.
     // Cheap when nothing has changed — one directory scan, no file I/O.
+    // Recompute what the per-point test needs, and reject a sector that
+    // would pass nothing. A silently empty sector looks exactly like a TF
+    // failure in the logs, and it feeds degenerate clouds downstream.
+    void updateFovDerived()
+    {
+        if (fov_min_range_ < 0.0) fov_min_range_ = 0.0;
+        if (fov_max_range_ <= fov_min_range_)
+        {
+            RCLCPP_WARN(get_logger(),
+                "fov_max_range (%.3f) <= fov_min_range (%.3f) — the sector is "
+                "empty. Forcing fov_max_range to fov_min_range + 0.1.",
+                fov_max_range_, fov_min_range_);
+            fov_max_range_ = fov_min_range_ + 0.1;
+        }
+        fov_min_range_sq_ = static_cast<float>(fov_min_range_ * fov_min_range_);
+        fov_max_range_sq_ = static_cast<float>(fov_max_range_ * fov_max_range_);
+
+        // ---- elevation ----
+        // Elevation does not wrap, so min above max is simply an error.
+        if (fov_min_elevation_deg_ > fov_max_elevation_deg_)
+        {
+            RCLCPP_WARN(get_logger(),
+                "fov_min_elevation_deg (%.1f) > fov_max_elevation_deg (%.1f) — "
+                "swapping them.",
+                fov_min_elevation_deg_, fov_max_elevation_deg_);
+            std::swap(fov_min_elevation_deg_, fov_max_elevation_deg_);
+        }
+
+        // The test below compares z against tan(elevation) * rho, which is
+        // the same ordering as comparing the angles themselves but avoids
+        // an asin per point. tan() is only monotonic on (-90, +90), and is
+        // NEGATIVE past 90, which would silently invert the test — so a
+        // request reaching either pole becomes "no elevation limit" instead.
+        fov_el_full_ = (fov_min_elevation_deg_ <= -89.9 &&
+                        fov_max_elevation_deg_ >=  89.9);
+        if (!fov_el_full_)
+        {
+            const double lo = std::clamp(fov_min_elevation_deg_, -89.9, 89.9);
+            const double hi = std::clamp(fov_max_elevation_deg_, -89.9, 89.9);
+            fov_tan_el_min_ = static_cast<float>(std::tan(lo * M_PI / 180.0));
+            fov_tan_el_max_ = static_cast<float>(std::tan(hi * M_PI / 180.0));
+        }
+
+        // ---- azimuth ----
+        // Azimuth DOES wrap, so min above max is meaningful: it is a wedge
+        // straddling +-180. The span is measured counter-clockwise from
+        // min to max, so -170 -> 170 is the wide 340 deg wedge and
+        // 170 -> -170 is the narrow 20 deg one. A raw difference of a
+        // full turn or more (e.g. -180 -> 180) means the whole circle;
+        // that has to be caught before the fmod, which would fold it to 0
+        // and pass nothing.
+        const double raw = fov_max_azimuth_deg_ - fov_min_azimuth_deg_;
+        if (std::abs(raw) >= 360.0)
+        {
+            fov_az_full_ = true;
+            fov_az_span_ = 360.0f;
+        }
+        else
+        {
+            double span = std::fmod(raw, 360.0);
+            if (span < 0.0) span += 360.0;
+            fov_az_full_ = (span >= 359.999);
+            fov_az_span_ = static_cast<float>(span);
+        }
+        fov_az_min_f_ = static_cast<float>(fov_min_azimuth_deg_);
+    }
+
+    // True when (x, y, z) in the LIDAR frame is inside the crop sector.
+    //
+    // Ordered cheapest test first, because this is the hottest loop in
+    // the node: ~20k points per scan at 10 Hz. Range costs nothing but
+    // multiplies, elevation costs one sqrt, azimuth costs an atan2 and
+    // is skipped entirely when the whole circle is wanted.
+    inline bool inFov(float x, float y, float z) const
+    {
+        const float rho2 = x * x + y * y;
+        const float r2   = rho2 + z * z;
+        if (r2 < fov_min_range_sq_ || r2 > fov_max_range_sq_) return false;
+
+        if (!fov_el_full_)
+        {
+            // rho >= 0, so multiplying through by it preserves the
+            // inequality: z/rho >= tan(lo)  <=>  z >= tan(lo)*rho.
+            const float rho = std::sqrt(rho2);
+            if (z < fov_tan_el_min_ * rho) return false;
+            if (z > fov_tan_el_max_ * rho) return false;
+        }
+
+        if (fov_az_full_) return true;
+
+        // How far counter-clockwise the point sits from the lower edge.
+        // Folding into [0, 360) first means a wedge across +-180 needs no
+        // special case.
+        constexpr float RAD2DEG = 180.0f / static_cast<float>(M_PI);
+        float d = std::fmod(std::atan2(y, x) * RAD2DEG - fov_az_min_f_, 360.0f);
+        if (d < 0.0f) d += 360.0f;
+        return d <= fov_az_span_;
+    }
+
     void checkForNewMesh()
     {
         if (!collecting_) return;
@@ -910,6 +1278,37 @@ private:
             return;
         }
 
+        // The control panel changes these between runs with a parameter
+        // set; re-read them here so a new run uses the current sector.
+        fov_min_range_         = get_parameter("fov_min_range").as_double();
+        fov_max_range_         = get_parameter("fov_max_range").as_double();
+        fov_min_azimuth_deg_   = get_parameter("fov_min_azimuth_deg").as_double();
+        fov_max_azimuth_deg_   = get_parameter("fov_max_azimuth_deg").as_double();
+        fov_min_elevation_deg_ = get_parameter("fov_min_elevation_deg").as_double();
+        fov_max_elevation_deg_ = get_parameter("fov_max_elevation_deg").as_double();
+        updateFovDerived();
+
+        apply_final_bounds_ = get_parameter("apply_final_bounds").as_bool();
+        final_min_x_ = get_parameter("final_min_x").as_double();
+        final_max_x_ = get_parameter("final_max_x").as_double();
+        final_min_y_ = get_parameter("final_min_y").as_double();
+        final_max_y_ = get_parameter("final_max_y").as_double();
+        final_min_z_ = get_parameter("final_min_z").as_double();
+        final_max_z_ = get_parameter("final_max_z").as_double();
+
+        RCLCPP_INFO(get_logger(),
+            "FOV sector: range [%.3f, %.3f] m, azimuth %s, elevation %s%s",
+            fov_min_range_, fov_max_range_,
+            fov_az_full_
+                ? "full 360 deg"
+                : (std::to_string(static_cast<int>(fov_min_azimuth_deg_)) + " to "
+                 + std::to_string(static_cast<int>(fov_max_azimuth_deg_)) + " deg").c_str(),
+            fov_el_full_
+                ? "unlimited"
+                : (std::to_string(static_cast<int>(fov_min_elevation_deg_)) + " to "
+                 + std::to_string(static_cast<int>(fov_max_elevation_deg_)) + " deg").c_str(),
+            apply_final_bounds_ ? "  (final bounds on)" : "");
+
         if (!openRunDirectory())
         {
             res->success = false;
@@ -934,6 +1333,10 @@ private:
 
         snapshot_count_ = 0;
         live_mesh_floor_ = 0;
+
+        // A selection armed against the previous map must not survive into
+        // a new run: its indices point into a cloud that is about to change.
+        resetClusterSelection();
         snapshot_timer_ = create_wall_timer(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::duration<double>(snapshot_period_sec_)),
@@ -1019,6 +1422,7 @@ private:
         // written is the first one built from the cleared map.
         live_mesh_floor_ = snapshot_count_;
 
+        resetClusterSelection();     // cached cluster indices are now stale
         clearRVizVisualizations();   // clouds, markers, mesh, path
         publishSelectedNormals();    // empty PoseArray + DELETEALL
 
@@ -1285,6 +1689,19 @@ private:
         const pcl::PointCloud<pcl::Normal>::Ptr& normals,
         const std_msgs::msg::Header& header)
     {
+        // RANSAC's sampler indexes with `rnd() % (n - i)`. Feed it a mesh with
+        // fewer faces than the model's sample size and the process dies with
+        // SIGFPE rather than returning an error. Normals must also match the
+        // cloud one-for-one, or the model silently reads past the end.
+        if (!cloud || !normals || cloud->size() < 10 ||
+            cloud->size() != normals->size())
+        {
+            RCLCPP_WARN(get_logger(),
+                "Skipping cylinder fit: %zu faces, %zu normals.",
+                cloud ? cloud->size() : 0, normals ? normals->size() : 0);
+            has_cylinder_ = false;
+            return;
+        }
         pcl::SACSegmentationFromNormals<PointT, pcl::Normal> seg;
         seg.setOptimizeCoefficients(true);
         seg.setModelType(pcl::SACMODEL_CYLINDER);
@@ -1376,6 +1793,7 @@ private:
         cylinder_marker_pub_->publish(marker_array);
 
         // Store for later use (e.g. picking a rim point as a grasp target)
+        last_cylinder_mid_        = 0.5f * (p_start + p_end);   // centroid of the drawn axis
         last_cylinder_axis_point_ = axis_point;
         last_cylinder_axis_dir_   = axis_dir;
         last_cylinder_radius_     = radius;
@@ -1388,6 +1806,17 @@ private:
     void onClickedPoint(
         const geometry_msgs::msg::PointStamped::SharedPtr msg)
     {
+        // ---------------------------------------------------------
+        // 0a. Cluster removal takes the click first. While armed, a
+        //     click picks a cluster instead of a normal — one RViz tool
+        //     (Publish Point), two meanings, chosen by mode.
+        // ---------------------------------------------------------
+        if (cluster_armed_)
+        {
+            onClusterClick(msg);
+            return;
+        }
+
                 // ---------------------------------------------------------
         // 0. Clicks are allowed as soon as any mesh is loaded —
         //    live during collection, or the final mesh after it.
@@ -2207,6 +2636,400 @@ private:
 
 
     // Clear all RViz visualizations (point clouds, markers, mesh) before starting a new collection or after saving the map
+
+    // =========================================================
+    // CLUSTER REMOVAL
+    //
+    // Purpose: a scan of a tree trunk should end up as ONE connected
+    // cluster. Anything else in the box — a pot, a wall, a bench leg —
+    // is a separate cluster, and deleting it here is cheaper than
+    // re-scanning with a tighter crop box.
+    //
+    // Flow:
+    //   /cluster_map              cluster the map, refuse if <= 1 cluster
+    //   click in RViz             pick the cluster under the click
+    //   /confirm_cluster_removal  delete it from global_map_
+    //   /cancel_cluster_removal   drop the selection, change nothing
+    //
+    // Nothing is deleted until the confirm service is called, so the GUI
+    // can put a dialog between the click and the deletion.
+    // =========================================================
+
+    // One line of machine-readable state for the GUI, latched so a panel
+    // that connects late still sees it. Pipe-separated because the panel
+    // only has to split() it — no new message package to build.
+    //   idle
+    //   armed|<n_clusters>
+    //   pending|<index>|<n_clusters>|<points_in_cluster>|<x>|<y>|<z>
+    void publishClusterStatus(const std::string& line)
+    {
+        std_msgs::msg::String msg;
+        msg.data = line;
+        cluster_status_pub_->publish(msg);
+    }
+
+    // Drop the armed selection and repaint. Called from the cancel
+    // service, after a successful removal, and whenever the map changes
+    // underneath us (/clear_map, /start_collection) — cluster_indices_
+    // index into cluster_cloud_, so a stale pair could delete the wrong
+    // points entirely.
+    void resetClusterSelection()
+    {
+        cluster_armed_    = false;
+        pending_cluster_  = -1;
+        cluster_cloud_.reset();
+        cluster_tree_.reset();
+        cluster_indices_.clear();
+        cluster_label_.clear();
+        publishClusterPreview();     // empty cloud: RViz clears the overlay
+        publishClusterStatus("idle");
+    }
+
+    // Publish the clustered copy as XYZRGB: one colour per cluster, red
+    // for the pending one, dark grey for points no cluster claimed.
+    // Empty cloud when nothing is armed — toROSMsg still writes the x/y/z
+    // fields, which is what makes RViz drop the old overlay rather than
+    // keep showing it.
+    void publishClusterPreview()
+    {
+        static const uint8_t palette[10][3] = {
+            { 46, 204, 113}, { 52, 152, 219}, {241, 196,  15},
+            {155,  89, 182}, { 26, 188, 156}, {230, 126,  34},
+            { 52,  73,  94}, { 39, 174,  96}, {142,  68, 173},
+            {127, 140, 141},
+        };
+
+        pcl::PointCloud<pcl::PointXYZRGB> rgb;
+
+        if (cluster_cloud_ && cluster_label_.size() == cluster_cloud_->size())
+        {
+            rgb.reserve(cluster_cloud_->size());
+            for (std::size_t i = 0; i < cluster_cloud_->size(); ++i)
+            {
+                const auto& p = cluster_cloud_->points[i];
+                pcl::PointXYZRGB q;
+                q.x = p.x; q.y = p.y; q.z = p.z;
+
+                const int label = cluster_label_[i];
+                if (label < 0)                        // below min_points
+                {
+                    q.r = q.g = q.b = 80;
+                }
+                else if (label == pending_cluster_)   // about to be deleted
+                {
+                    q.r = 255; q.g = 40; q.b = 40;
+                }
+                else
+                {
+                    const uint8_t* c = palette[label % 10];
+                    q.r = c[0]; q.g = c[1]; q.b = c[2];
+                }
+                rgb.push_back(q);
+            }
+        }
+
+        sensor_msgs::msg::PointCloud2 out;
+        pcl::toROSMsg(rgb, out);
+        out.header.frame_id = frame_id_;
+        out.header.stamp = now();
+        clusters_pub_->publish(out);
+    }
+
+    // ---- /cluster_map : split the map and arm a selection ----
+    void clusterMapService(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        // Same guard as /clear_map: finalizeRun() is queued on a 1 ms timer
+        // and is about to read global_map_ for the final save and mesh.
+        if (finalize_timer_ && !finalize_timer_->is_canceled())
+        {
+            response->success = false;
+            response->message = "Run is finalising. Try again once the final mesh is loaded.";
+            return;
+        }
+
+        // Work on a voxelised COPY, taken under the lock and released
+        // immediately: cloudCallback() keeps accumulating while we cluster.
+        pcl::PointCloud<pcl::PointXYZ>::Ptr work(new pcl::PointCloud<pcl::PointXYZ>);
+        std::size_t map_points = 0;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            if (!global_map_ || global_map_->size() < 100)
+            {
+                response->success = false;
+                response->message = "Map is empty or too sparse to cluster.";
+                return;
+            }
+            map_points = global_map_->size();
+
+            pcl::VoxelGrid<pcl::PointXYZ> vg;
+            vg.setInputCloud(global_map_);
+            vg.setLeafSize(cluster_voxel_, cluster_voxel_, cluster_voxel_);
+            vg.filter(*work);
+        }
+
+        // EuclideanClusterExtraction is a flood fill over a radius graph:
+        // seed a point, absorb everything within cluster_tolerance_, repeat
+        // from each absorbed point until nothing new joins. The KD-tree is
+        // what makes each neighbour query log-time instead of linear.
+        pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
+        tree->setInputCloud(work);
+
+        std::vector<pcl::PointIndices> indices;
+        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+        ec.setClusterTolerance(cluster_tolerance_);
+        ec.setMinClusterSize(cluster_min_points_);
+        ec.setMaxClusterSize(cluster_max_points_);
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(work);
+
+        t.start();
+        ec.extract(indices);
+        const double cluster_ms = t.stop_ms();
+
+        // extract() already returns clusters largest-first, but that is
+        // documented behaviour rather than a guarantee, and the indices
+        // are what the GUI shows the user — so sort explicitly.
+        std::sort(indices.begin(), indices.end(),
+                  [](const pcl::PointIndices& a, const pcl::PointIndices& b)
+                  { return a.indices.size() > b.indices.size(); });
+
+        RCLCPP_INFO(get_logger(),
+            "cluster_map: %zu points -> %zu voxels -> %zu cluster(s) (%.1f ms)",
+            map_points, work->size(), indices.size(), cluster_ms);
+
+        if (indices.size() <= 1)
+        {
+            // Exactly what a clean trunk scan should look like: refuse,
+            // and leave the map untouched.
+            resetClusterSelection();
+            response->success = false;
+            response->message =
+                indices.empty()
+                ? "No cluster reached cluster_min_points — nothing to remove."
+                : "Only 1 cluster — the scan is already a single object.";
+            return;
+        }
+
+        // Per-point label, so a click resolves to a cluster with one
+        // nearest-neighbour lookup instead of a scan over every cluster.
+        cluster_label_.assign(work->size(), -1);
+        for (std::size_t c = 0; c < indices.size(); ++c)
+            for (int i : indices[c].indices)
+                cluster_label_[static_cast<std::size_t>(i)] = static_cast<int>(c);
+
+        cluster_cloud_   = work;
+        cluster_tree_    = tree;
+        cluster_indices_ = indices;
+        pending_cluster_ = -1;
+        cluster_armed_   = true;
+
+        publishClusterPreview();
+        publishClusterStatus("armed|" + std::to_string(indices.size()));
+
+        std::ostringstream msg;
+        msg << indices.size() << " clusters (";
+        for (std::size_t c = 0; c < indices.size() && c < 5; ++c)
+            msg << (c ? ", " : "") << indices[c].indices.size();
+        if (indices.size() > 5) msg << ", ...";
+        msg << " voxels). Click a point in the cluster to remove.";
+
+        response->success = true;
+        response->message = msg.str();
+    }
+
+    // ---- a click while armed : pick the cluster under it ----
+    void onClusterClick(const geometry_msgs::msg::PointStamped::SharedPtr msg)
+    {
+        if (!cluster_cloud_ || !cluster_tree_)
+        {
+            RCLCPP_WARN(get_logger(), "Cluster click with no clustered cloud.");
+            return;
+        }
+
+        PointT click_pt;
+        click_pt.x = static_cast<float>(msg->point.x);
+        click_pt.y = static_cast<float>(msg->point.y);
+        click_pt.z = static_cast<float>(msg->point.z);
+
+        std::vector<int>   idx(1);
+        std::vector<float> dist2(1);
+        if (cluster_tree_->nearestKSearch(click_pt, 1, idx, dist2) < 1)
+        {
+            RCLCPP_WARN(get_logger(), "Cluster KD-tree returned no result.");
+            return;
+        }
+
+        const double dist = std::sqrt(static_cast<double>(dist2[0]));
+        if (dist > cluster_click_radius_)
+        {
+            RCLCPP_WARN(get_logger(),
+                "Click was %.3f m from the nearest clustered point "
+                "(limit %.3f m) — ignored.", dist, cluster_click_radius_);
+            return;
+        }
+
+        const int label = cluster_label_[static_cast<std::size_t>(idx[0])];
+        if (label < 0)
+        {
+            RCLCPP_WARN(get_logger(),
+                "That point belongs to no cluster (below cluster_min_points).");
+            return;
+        }
+
+        pending_cluster_ = label;
+        publishClusterPreview();     // repaint: the pick turns red
+
+        std::ostringstream line;
+        line << "pending|" << label
+             << "|" << cluster_indices_.size()
+             << "|" << cluster_indices_[label].indices.size()
+             << "|" << msg->point.x
+             << "|" << msg->point.y
+             << "|" << msg->point.z;
+        publishClusterStatus(line.str());
+
+        RCLCPP_INFO(get_logger(),
+            "Cluster %d of %zu selected (%zu voxels), click %.3f m away. "
+            "Waiting for confirmation.",
+            label, cluster_indices_.size(),
+            cluster_indices_[label].indices.size(), dist);
+    }
+
+    // ---- /confirm_cluster_removal : delete the pending cluster ----
+    void confirmClusterRemovalService(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        if (!cluster_armed_ || pending_cluster_ < 0)
+        {
+            response->success = false;
+            response->message = "No cluster selected — click one in RViz first.";
+            return;
+        }
+
+        const auto& picked = cluster_indices_[pending_cluster_].indices;
+
+        // The cluster is made of VOXEL CENTRES, not of real map points, so
+        // it cannot be erased by index. Instead: build a KD-tree on the
+        // real map, and drop every real point within one voxel of a picked
+        // centre. A voxel's half-diagonal is 0.866 x leaf, so a radius of
+        // one leaf covers the whole cell with margin.
+        const double radius = std::max(cluster_voxel_, 1e-4);
+
+        std::size_t before = 0, after = 0;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            if (!global_map_ || global_map_->empty())
+            {
+                response->success = false;
+                response->message = "Map is empty — nothing to remove.";
+                return;
+            }
+            before = global_map_->size();
+
+            pcl::KdTreeFLANN<pcl::PointXYZ> tree;
+            tree.setInputCloud(global_map_);
+
+            std::vector<char> drop(before, 0);     // vector<bool> is a bitfield; char is plain
+            std::vector<int>   nb;
+            std::vector<float> nd;
+
+            t.start();
+            for (int i : picked)
+            {
+                if (tree.radiusSearch(cluster_cloud_->points[i], radius, nb, nd) > 0)
+                    for (int j : nb)
+                        drop[static_cast<std::size_t>(j)] = 1;
+            }
+
+            pcl::PointCloud<pcl::PointXYZ>::Ptr kept(new pcl::PointCloud<pcl::PointXYZ>);
+            kept->reserve(before);
+            for (std::size_t k = 0; k < before; ++k)
+                if (!drop[k]) kept->push_back(global_map_->points[k]);
+
+            // push_back maintains width/height for an unorganised cloud,
+            // but set them explicitly: an inconsistent header makes
+            // savePCDFileBinary write a file PCL then refuses to read.
+            kept->width    = static_cast<uint32_t>(kept->size());
+            kept->height   = 1;
+            kept->is_dense = global_map_->is_dense;
+
+            global_map_ = kept;
+            after = kept->size();
+        }
+
+        const double remove_ms = t.stop_ms();
+        const std::size_t removed = before - after;
+
+        resetClusterSelection();
+
+        // Republish so RViz shows the map without the cluster immediately.
+        {
+            sensor_msgs::msg::PointCloud2 out;
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                pcl::toROSMsg(*global_map_, out);
+            }
+            out.header.frame_id = frame_id_;
+            out.header.stamp = now();
+            global_map_pub_->publish(out);
+
+            // Only the finished run publishes /processed/map, and the
+            // keepalive timer republishes last_processed_msg_ every second
+            // — so that cached copy has to be updated too, or the old map
+            // comes straight back.
+            if (pipeline_done_)
+            {
+                processed_pub_->publish(out);
+                last_processed_msg_ = out;
+            }
+        }
+
+        // Make the change reach the mesh, which is what the click-to-select
+        // and cylinder fit actually use.
+        std::string note;
+        if (collecting_)
+        {
+            // Snapshot now rather than waiting up to snapshot_period_sec_;
+            // the mesh watcher picks it up and the live mesh catches up.
+            writeSnapshot();
+            note = " New snapshot written; the live mesh will catch up.";
+        }
+        else
+        {
+            // Overwrite this run's PCD so a re-mesh uses the cleaned cloud.
+            saved_ = false;
+            saveMap();
+            note = " Saved map rewritten: " + save_path_
+                 + " — rebuild the mesh to update it.";
+        }
+
+        std::ostringstream msg;
+        msg << "Removed " << removed << " of " << before << " points ("
+            << after << " left, " << std::fixed << std::setprecision(1)
+            << remove_ms << " ms)." << note;
+
+        RCLCPP_INFO(get_logger(), "confirm_cluster_removal: %s", msg.str().c_str());
+        response->success = true;
+        response->message = msg.str();
+    }
+
+    // ---- /cancel_cluster_removal : drop the selection, change nothing ----
+    void cancelClusterRemovalService(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        const bool was_armed = cluster_armed_;
+        resetClusterSelection();
+
+        RCLCPP_INFO(get_logger(), "cancel_cluster_removal: selection dropped.");
+        response->success = true;
+        response->message = was_armed ? "Cluster selection cancelled."
+                                      : "No cluster selection was active.";
+    }
+
      void clearRVizVisualizations()
     {
         RCLCPP_INFO(
@@ -2229,6 +3052,7 @@ private:
         global_map_pub_->publish(empty_cloud);
         processed_pub_->publish(empty_cloud);
         rim_pub_->publish(empty_cloud);
+        clusters_pub_->publish(empty_cloud);   // cluster overlay
         last_processed_msg_ = empty_cloud;   // keepalive must not resurrect the old map
 
         // ---------------------------------------------------------
@@ -2291,8 +3115,16 @@ private:
     bool apply_final_bounds_ = false;
     double final_min_x_, final_max_x_, final_min_y_, final_max_y_, final_min_z_, final_max_z_;
     int sor_mean_k_;
-    double min_x_, max_x_, min_y_, max_y_, min_z_, max_z_;
-    double min_range_ = 0.05;
+    // Per-scan crop sector in LiDAR-frame spherical coords (constructor).
+    double fov_min_range_ = 0.10, fov_max_range_ = 0.60;
+    double fov_min_azimuth_deg_ = -20.0, fov_max_azimuth_deg_ = 20.0;
+    double fov_min_elevation_deg_ = -20.0, fov_max_elevation_deg_ = 20.0;
+
+    // Derived; updateFovDerived() owns all of these.
+    float fov_min_range_sq_ = 0.0f, fov_max_range_sq_ = 0.0f;
+    float fov_tan_el_min_ = 0.0f, fov_tan_el_max_ = 0.0f;
+    float fov_az_min_f_ = 0.0f, fov_az_span_ = 360.0f;
+    bool  fov_az_full_ = false, fov_el_full_ = false;
     int max_ransac_iterations_;
     double min_ransac_radius_, max_ransac_radius_, ransac_probability_;
     double snapshot_period_sec_;
@@ -2354,6 +3186,11 @@ private:
     double tf_buffer_sec_ = 10.0;
     std::size_t scans_dropped_ = 0;
 
+    // ---- Deskew ----
+    bool deskew_ = true;
+    int  deskew_buckets_ = 10;
+    std::size_t deskew_pose_misses_ = 0;
+
     // ---- Drone trajectory ----
     bool        publish_trajectory_ = true;
     std::string drone_frame_, trajectory_topic_;
@@ -2365,6 +3202,14 @@ private:
     rclcpp::Time                 last_trajectory_stamp_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
     rclcpp::TimerBase::SharedPtr trajectory_timer_;
+
+    // drone -> trunk axis midpoint
+    bool        publish_offset_ = true;
+    std::string offset_topic_;
+    double      offset_period_sec_ = 0.05;
+    Eigen::Vector3f last_cylinder_mid_ = Eigen::Vector3f::Zero();
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr offset_pub_;
+    rclcpp::TimerBase::SharedPtr offset_timer_;
 
     std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -2395,6 +3240,29 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr load_path_srv_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_path_srv_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_trajectory_srv_;
+
+    // ---- Cluster removal ----
+    double cluster_voxel_        = 0.01;   // leaf of the copy that gets clustered
+    double cluster_tolerance_    = 0.05;   // join distance
+    int    cluster_min_points_   = 50;     // in voxels, not raw points
+    int    cluster_max_points_   = 10000000;
+    double cluster_click_radius_ = 0.10;   // a click further away is ignored
+    std::string clusters_topic_, cluster_status_topic_;
+
+    bool cluster_armed_   = false;         // clicks pick clusters, not normals
+    int  pending_cluster_ = -1;            // -1 = armed but nothing clicked yet
+
+    pcl::PointCloud<PointT>::Ptr    cluster_cloud_;     // the voxelised copy
+    pcl::search::KdTree<PointT>::Ptr cluster_tree_;     // KD-tree on that copy
+    std::vector<pcl::PointIndices>  cluster_indices_;   // largest cluster first
+    std::vector<int>                cluster_label_;     // per copy point, -1 = none
+
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr clusters_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr         cluster_status_pub_;
+
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cluster_map_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr confirm_cluster_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_cluster_srv_;
 };
 
 int main(int argc, char **argv)
