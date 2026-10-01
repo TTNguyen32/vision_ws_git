@@ -14,14 +14,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" # Path setup: this fi
 
 # Config variables
 WORKSPACE="${WORKSPACE:-$HOME/vision_ws}"
-TOOLS_DIR="${TOOLS_DIR:--$SCRIPT_DIR/lidar-tools}"
+TOOLS_DIR="${TOOLS_DIR:-$HOME/lidar-tools}"
 
 OUTPUT_DIR="$HOME/vision_ws_outputs"
 LOCKED_TARGET_FILE="$OUTPUT_DIR/locked_target.yaml"
 
 MESH_RECONSTRUCT="$TOOLS_DIR/pcd_to_stl.py"
 SPLINE_SCRIPT="$TOOLS_DIR/offset_spline.py"
-RVIZ_CONFIG="$SCRIPT_DIR/../config/map_pip.rviz"
+RVIZ_CONFIG="$WORKSPACE/src/cloud_accumulator/src/map_pip.rviz"
 
 CONDA_ENV="lidar"
 

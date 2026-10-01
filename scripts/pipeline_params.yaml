@@ -34,17 +34,34 @@ node:
   duplicate_distance: 0.005     # new points closer than this to the map are dropped (m)
   tf_lookup_timeout_sec: 0.1
 
-  # ---- bounding box, in frame_id (m) ----
-  min_x: 0.0
-  max_x: 0.5
-  min_y: -0.2
-  max_y: 0.2
-  min_z: 0.0
-  max_z: 0.2
+  # ---- per-scan crop sector, in the LIDAR frame ----
+  # A wedge in spherical coordinates about the sensor origin:
+  #
+  #   azimuth   atan2(y, x).  0 = +x boresight, +90 = +y. Wraps at +-180,
+  #             so min > max is legal and means a wedge across the back
+  #             (170 -> -170 is a 20 deg wedge). -180 -> 180 is the lot.
+  #   elevation angle above the xy plane. +90 = straight up.
+  #   range     true radial distance |p|, not axial.
+  #
+  # Mid-360 hardware limits, for reference:
+  #   azimuth 360 deg, elevation -7 to +52 deg, blind zone 0.1 m.
+  # Asking for more than that is harmless, the limit just never binds.
+  #
+  # fov_min_range also drops the (0,0,0) no-return beams, which is what
+  # the old min_range parameter was for.
+  fov_min_range: 0.1
+  fov_max_range: 0.6
+  fov_min_azimuth_deg: -20.0
+  fov_max_azimuth_deg: 20.0
+  fov_min_elevation_deg: 20.0
+  fov_max_elevation_deg: 50.0
 
   # ---- final cloud cleanup (statistical outlier removal) ----
   sor_mean_k: 50                # int. Keep small: k=2000 froze the node
   sor_stddev_mult: 10.0
+  cluster_voxel: 0.01 # for cluster removal
+  cluster_tolerance: 0.03
+  cluster_min_points: 10 
 
   # ---- cylinder fit (RANSAC) ----
   max_ransac_iterations: 1000   # int. Main cost of live cylinder fits
@@ -57,8 +74,8 @@ node:
   generate_path: true
 
   # ---- frames ----
-  frame_id: odom
-  world_frame: odom
+  frame_id: world
+  world_frame: world
   lidar_frame: lidar
 
   # ---- topics ----
@@ -90,7 +107,7 @@ mesh:
   # snapshot_period_sec or the live mesh falls behind.
   live:
     method: poisson
-    poisson_depth: 7
+    poisson_depth: 5
     orient: radial              # outward from fitted trunk axis (multi-view safe)
     axis_dir: null              # e.g. [0, 0, 1] if the fitted axis tilts
     density_quantile: 0.1
@@ -100,7 +117,7 @@ mesh:
   # Runs once after 'e'; quality over speed.
   final:
     method: poisson
-    poisson_depth: 9
+    poisson_depth: 8
     orient: radial
     axis_dir: null
     density_quantile: 0.10
